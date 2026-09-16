@@ -149,10 +149,23 @@ def _check_import_permissions(args: argparse.Namespace) -> None:
         "generic_assay_meta_derived",
     )
     checks: list[tuple[str, str]] = [("SELECT", table) for table in readable]
-    checks.extend(("INSERT", table) for table in (*wsi_tables, *clinical_tables))
+    checks.extend(
+        ("INSERT", table)
+        for table in (*wsi_tables, *clinical_tables, "sample_profile", *derived_tables)
+    )
     checks.extend(("ALTER DELETE", table) for table in (*wsi_tables, *clinical_tables))
     checks.extend(("TRUNCATE", table) for table in derived_tables)
-    checks.extend(("OPTIMIZE", table) for table in ("clinical_patient", "clinical_sample", "genetic_alteration", "genetic_profile_samples", "sample_profile", *derived_tables))
+    checks.extend(
+        ("OPTIMIZE", table)
+        for table in (
+            "clinical_patient",
+            "clinical_sample",
+            "genetic_alteration",
+            "genetic_profile_samples",
+            "sample_profile",
+            *derived_tables,
+        )
+    )
     missing: list[tuple[str, str]] = []
     for privilege, table in checks:
         result = _query_rows(
