@@ -52,9 +52,9 @@ exporter's explicit --allow-incomplete-assets flag only for diagnosis; it is
 not valid for an accepted study release.
 
 The default run checks every WSI patient hierarchy and every servable access
-bundle (including thumbnails), plus a bounded sample of 24 event-bearing
-patients and three real tile paths. Set TIMELINE_PATIENT_SAMPLE to a positive
-value only for a bounded diagnostic run. Set
+bundle (including thumbnails), every event-bearing patient, and three real tile
+paths. Set TIMELINE_PATIENT_SAMPLE to a positive value only for a bounded
+diagnostic run. Set
 VERIFY_ALL_ACCESS=0 only for a bounded diagnostic run;
 VERIFY_ALL_TILES=1 additionally checks pixel tiles.
 USAGE
