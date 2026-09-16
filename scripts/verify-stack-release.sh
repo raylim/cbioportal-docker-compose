@@ -29,10 +29,11 @@ Optional environment:
   CLICKHOUSE_PASSWORD        ClickHouse password; never echoed
 
 The manifest must use version 1 and contain one entry per study, with
-study_id and study_dir. Every entry must contain meta_wsi.txt and a valid
-wsi_snapshot_manifest.json with non-zero association, servable, and patient
-counts and incomplete_asset_count=0. Studies without a complete WSI asset
-contract are rejected.
+study_id and study_dir. Every entry must contain meta_wsi.txt, both pathology
+timeline files, and a valid wsi_snapshot_manifest.json with non-zero
+association, servable, and patient counts and incomplete_asset_count=0. The
+gate checks every servable access bundle (including thumbnails); studies
+without a complete WSI asset contract are rejected.
 USAGE
   exit 0
 fi
