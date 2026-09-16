@@ -61,11 +61,11 @@ class PortalTileContractTests(unittest.TestCase):
         )
         self.assertIn("s3://ocra/", E2E_SCRIPT)
         self.assertIn(
-            '--timeline-patient-sample "${TIMELINE_PATIENT_SAMPLE:-24}"',
+            '--timeline-patient-sample "${TIMELINE_PATIENT_SAMPLE:-0}"',
             E2E_SCRIPT,
         )
         self.assertIn(
-            'args+=(--timeline-patient-sample "${TIMELINE_PATIENT_SAMPLE:-24}")',
+            'args+=(--timeline-patient-sample "${TIMELINE_PATIENT_SAMPLE:-0}")',
             STACK_SCRIPT,
         )
 

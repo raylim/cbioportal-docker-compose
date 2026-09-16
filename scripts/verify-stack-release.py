@@ -351,8 +351,11 @@ def main() -> int:
     parser.add_argument(
         "--timeline-patient-sample",
         type=int,
-        default=_env_int("TIMELINE_PATIENT_SAMPLE", 24),
-        help="event-bearing patients checked per study when --check-all-wsi is enabled",
+        default=_env_int("TIMELINE_PATIENT_SAMPLE", 0),
+        help=(
+            "event-bearing patients checked per study when --check-all-wsi is enabled "
+            "(0 means every event-bearing patient)"
+        ),
     )
     parser.add_argument(
         "--all-tiles",

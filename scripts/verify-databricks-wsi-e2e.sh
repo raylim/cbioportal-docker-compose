@@ -25,7 +25,7 @@ Stack configuration:
   WSI_TILE_SERVER_URL          deprecated alias for EXPECTED_WSI_TILE_SERVER_URL
   WSI_SAMPLE_SIZE              servable slide sample size (default: 3)
   TIMELINE_PATIENT_SAMPLE      event-bearing patients checked with --check-all-wsi
-                                (default: 24; 0 requests every patient)
+                                (default: 0; every event-bearing patient)
 
 Databricks configuration:
   DATABRICKS_WAREHOUSE_ID   SQL warehouse (default: exporter default)
@@ -53,8 +53,8 @@ not valid for an accepted study release.
 
 The default run checks every WSI patient hierarchy and every servable access
 bundle (including thumbnails), plus a bounded sample of 24 event-bearing
-patients and three real tile paths. Set TIMELINE_PATIENT_SAMPLE=0 only when a
-complete patient-by-patient event check is affordable. Set
+patients and three real tile paths. Set TIMELINE_PATIENT_SAMPLE to a positive
+value only for a bounded diagnostic run. Set
 VERIFY_ALL_ACCESS=0 only for a bounded diagnostic run;
 VERIFY_ALL_TILES=1 additionally checks pixel tiles.
 USAGE
@@ -188,7 +188,7 @@ verify_args=(
   --check-timeline
   --require-wsi
   --check-all-wsi
-  --timeline-patient-sample "${TIMELINE_PATIENT_SAMPLE:-24}"
+  --timeline-patient-sample "${TIMELINE_PATIENT_SAMPLE:-0}"
   --check-wsi-clinical-counts
   --check-access
   --expected-tile-url "$expected_tile_url"

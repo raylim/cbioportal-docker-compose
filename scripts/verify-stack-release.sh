@@ -22,7 +22,7 @@ Optional environment:
   EXPECTED_WSI_TILE_SERVER_URL  optional assertion for portal tile configuration
   WSI_TILE_SERVER_URL        deprecated alias for EXPECTED_WSI_TILE_SERVER_URL
   WSI_SAMPLE_SIZE            real servable slides per study (default: 3)
-  TIMELINE_PATIENT_SAMPLE    event-bearing patients checked per study (default: 24)
+  TIMELINE_PATIENT_SAMPLE    event-bearing patients checked per study (default: 0, all)
   VERIFY_ALL_TILES           set to 1 to validate every slide's pixel path
   VERIFY_STUDY_TIMEOUT_SECONDS  per-study timeout (default: 1800)
   VERIFY_COOKIE              short-lived portal session cookie
@@ -67,6 +67,6 @@ fi
 if [[ "${VERIFY_ALL_TILES:-0}" == "1" ]]; then
   args+=(--all-tiles)
 fi
-args+=(--timeline-patient-sample "${TIMELINE_PATIENT_SAMPLE:-24}")
+args+=(--timeline-patient-sample "${TIMELINE_PATIENT_SAMPLE:-0}")
 
 exec python3 "$ROOT_DIR/scripts/verify-stack-release.py" "${args[@]}"
