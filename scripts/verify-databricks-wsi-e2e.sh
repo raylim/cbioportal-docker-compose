@@ -37,7 +37,7 @@ Databricks configuration:
                             to the stack's full tile-server publication list)
 
 Coverage controls:
-  VERIFY_ALL_ACCESS         set to 1 to validate every servable access bundle
+  VERIFY_ALL_ACCESS         set to 0 to opt out of validating every servable access bundle
   VERIFY_ALL_TILES          set to 1 to request tiles for all access bundles
   MAX_TILE_CHECKS            cap tile requests while retaining access coverage
   VERIFY_HTTP_TIMEOUT_SECONDS portal API timeout (default: 120)
@@ -51,11 +51,12 @@ including matched rows whose source is not inventory-backed. Use the
 exporter's explicit --allow-incomplete-assets flag only for diagnosis; it is
 not valid for an accepted study release.
 
-The default run checks every WSI patient hierarchy, a bounded sample of 24
-event-bearing patients, and three real access, thumbnail, and tile paths. Set
-TIMELINE_PATIENT_SAMPLE=0 only when a complete patient-by-patient event check
-is affordable. Set VERIFY_ALL_ACCESS=1 for the expensive complete
-access-bundle check; VERIFY_ALL_TILES=1 additionally checks pixel tiles.
+The default run checks every WSI patient hierarchy and every servable access
+bundle (including thumbnails), plus a bounded sample of 24 event-bearing
+patients and three real tile paths. Set TIMELINE_PATIENT_SAMPLE=0 only when a
+complete patient-by-patient event check is affordable. Set
+VERIFY_ALL_ACCESS=0 only for a bounded diagnostic run;
+VERIFY_ALL_TILES=1 additionally checks pixel tiles.
 USAGE
   exit 0
 fi
@@ -194,7 +195,7 @@ verify_args=(
   --wsi-sample-size "$wsi_sample_size"
 )
 
-if [[ "${VERIFY_ALL_ACCESS:-0}" == "1" ]]; then
+if [[ "${VERIFY_ALL_ACCESS:-1}" == "1" ]]; then
   verify_args+=(--check-all-access)
 fi
 if [[ "${VERIFY_ALL_TILES:-0}" == "1" ]]; then

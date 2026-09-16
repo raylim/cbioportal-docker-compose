@@ -263,7 +263,10 @@ def _verify_study(
         "--timeline-patient-sample",
         str(args.timeline_patient_sample),
         "--check-wsi-clinical-counts",
-        "--check-access",
+        # A release gate must exercise every servable access bundle.  The
+        # bounded --check-access smoke is useful during development, but it
+        # cannot catch a patient-specific missing source or thumbnail.
+        "--check-all-access",
         "--wsi-sample-size",
         str(args.wsi_sample_size),
         "--expected-tile-url",
@@ -275,7 +278,7 @@ def _verify_study(
     if _has_complete_molecular_snapshot(Path(study_dir)):
         command.append("--check-all-data")
     if check_all_tiles:
-        command.extend(["--check-all-access", "--check-all-tiles"])
+        command.append("--check-all-tiles")
     if args.cookie:
         command.extend(["--cookie", args.cookie])
 

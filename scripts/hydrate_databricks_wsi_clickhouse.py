@@ -57,6 +57,11 @@ def _args() -> argparse.Namespace:
                    help="0600-mode clickhouse-client YAML config")
     p.add_argument("--clickhouse-bin", default="clickhouse")
     p.add_argument("--database", required=True)
+    p.add_argument(
+        "--import-role",
+        default=os.environ.get("CLICKHOUSE_IMPORT_ROLE", "beta_wsi_import_role"),
+        help="role named in missing-permission remediation instructions",
+    )
     p.add_argument("--warehouse-id", default=os.environ.get("DATABRICKS_WAREHOUSE_ID", "0b49b7d78734ad5c"))
     p.add_argument("--canonical-table", default="cdsi_prod.pathology_data_mining.canonical_slide_associations")
     p.add_argument("--registry-table", default="cdsi_prod.pathology_data_mining.slide_thumbnail_registry")
@@ -66,6 +71,14 @@ def _args() -> argparse.Namespace:
                    help="keep the temporary SQLite staging database for diagnosis")
     p.add_argument("--staging-db", type=Path,
                    help="reuse a completed SQLite staging database (skips Databricks scan)")
+    p.add_argument(
+        "--allow-incomplete-assets",
+        action="store_true",
+        help=(
+            "diagnostic only: retain canonical rows whose asset bundle is incomplete; "
+            "never use this mode for an accepted release"
+        ),
+    )
     return p.parse_args()
 
 
@@ -97,6 +110,66 @@ def _query_rows(args: argparse.Namespace, query: str) -> list[list[str]]:
             values.append("" if value == r"\N" else value)
         rows.append(values)
     return rows
+
+
+def _check_import_permissions(args: argparse.Namespace) -> None:
+    """Fail before staging cleanup if the importer cannot complete a release.
+
+    The previous flow discovered missing RBAC only after deleting part of a
+    study.  ``CHECK GRANT`` is read-only and lets the caller fix the role before
+    any Databricks scan or ClickHouse mutation begins.
+    """
+    readable = ("cancer_study", "patient", "sample")
+    wsi_tables = (
+        "wsi_patient",
+        "wsi_part",
+        "wsi_block",
+        "wsi_slide",
+        "wsi_slide_placement",
+    )
+    clinical_tables = (
+        "clinical_attribute_meta",
+        "clinical_sample",
+        "clinical_patient",
+        "clinical_event",
+        "clinical_event_data",
+    )
+    derived_tables = (
+        "sample_to_gene_panel_derived",
+        "gene_panel_to_gene_derived",
+        "sample_derived",
+        "genomic_event_derived",
+        "clinical_data_derived",
+        "clinical_event_derived",
+        "clinical_event_data_derived",
+        "genetic_alteration_derived",
+        "generic_assay_data_derived",
+        "mutation_derived",
+        "generic_assay_profile_entity_derived",
+        "generic_assay_meta_derived",
+    )
+    checks: list[tuple[str, str]] = [("SELECT", table) for table in readable]
+    checks.extend(("INSERT", table) for table in (*wsi_tables, *clinical_tables))
+    checks.extend(("ALTER DELETE", table) for table in (*wsi_tables, *clinical_tables))
+    checks.extend(("TRUNCATE", table) for table in derived_tables)
+    checks.extend(("OPTIMIZE", table) for table in ("clinical_patient", "clinical_sample", "genetic_alteration", "genetic_profile_samples", "sample_profile", *derived_tables))
+    missing: list[tuple[str, str]] = []
+    for privilege, table in checks:
+        result = _query_rows(
+            args,
+            f"CHECK GRANT {privilege} ON {args.database}.{table} FORMAT TSV",
+        )
+        if not result or not result[0] or result[0][0] != "1":
+            missing.append((privilege, table))
+    if missing:
+        grants = "; ".join(
+            f"GRANT {privilege} ON {args.database}.{table} TO {args.import_role}"
+            for privilege, table in missing
+        )
+        raise RuntimeError(
+            "ClickHouse importer role is not authorized for a complete WSI "
+            f"hydration ({len(missing)} missing privileges). Run: {grants}"
+        )
 
 
 def _sql_ids(values: Iterable[int]) -> str:
@@ -217,7 +290,7 @@ def _rank(values: list[str]) -> str:
 
 
 def _stage(args: argparse.Namespace, db: sqlite3.Connection, patient_targets, sample_targets,
-           patient_stable_by_internal, prefixes) -> dict[str, int]:
+           patient_stable_by_internal, prefixes, *, require_complete_assets: bool) -> dict[str, int]:
     stats = defaultdict(int)
     asset_stats: dict[str, int] = {}
     selected = 0
@@ -249,7 +322,7 @@ def _stage(args: argparse.Namespace, db: sqlite3.Connection, patient_targets, sa
                 {patient_stable},
                 {canonical_sample} if valid_sample else set(),
                 {canonical_sample: patient_stable} if valid_sample else {},
-                require_complete_assets=False,
+                require_complete_assets=require_complete_assets,
                 asset_stats=asset_stats,
                 allowed_source_prefixes=prefixes,
             )
@@ -477,6 +550,7 @@ def main() -> int:
         raise RuntimeError("ClickHouse config must exist and be mode 0600")
     if shutil.which(args.clickhouse_bin) is None and not Path(args.clickhouse_bin).is_file():
         raise RuntimeError(f"ClickHouse client not found: {args.clickhouse_bin}")
+    _check_import_permissions(args)
     prefixes = exporter._source_prefixes(args.allowed_source_prefixes)
     patient_targets, sample_targets, patient_stable_by_internal = _load_target_maps(args)
     study_rows = _query_rows(args, "SELECT cancer_study_id, cancer_study_identifier FROM cancer_study FORMAT TSV")
@@ -496,9 +570,29 @@ def main() -> int:
             db.execute("PRAGMA journal_mode=OFF")
             db.execute("PRAGMA synchronous=OFF")
             db.execute("CREATE TABLE slides (study_id INTEGER NOT NULL, patient_internal INTEGER NOT NULL, image_id TEXT NOT NULL, sample_internal INTEGER, reference_internal INTEGER, rank_key TEXT NOT NULL, values_json TEXT NOT NULL, timing_json TEXT NOT NULL, PRIMARY KEY(study_id, patient_internal, image_id))")
-            stats = _stage(args, db, patient_targets, sample_targets, patient_stable_by_internal, prefixes)
+            stats = _stage(
+                args,
+                db,
+                patient_targets,
+                sample_targets,
+                patient_stable_by_internal,
+                prefixes,
+                require_complete_assets=not args.allow_incomplete_assets,
+            )
+            if not args.allow_incomplete_assets and stats.get("incomplete", 0):
+                raise RuntimeError(
+                    "Databricks WSI hydration found incomplete asset bundles; "
+                    "refusing to mutate ClickHouse"
+                )
         if stats.get("selected_rows", 0) == 0:
             raise RuntimeError("Databricks WSI data did not overlap any target patient/sample; refusing to mutate ClickHouse")
+        if args.allow_incomplete_assets:
+            print(
+                "WARNING: --allow-incomplete-assets is diagnostic only; this hydration "
+                "must not be treated as an accepted release",
+                file=sys.stderr,
+                flush=True,
+            )
         study_ids = [row[0] for row in db.execute("SELECT DISTINCT study_id FROM slides ORDER BY study_id")]
         print(json.dumps({"stage": stats, "study_ids": study_ids, "allowed_source_prefixes": prefixes}, sort_keys=True), flush=True)
         _cleanup(args, study_ids)

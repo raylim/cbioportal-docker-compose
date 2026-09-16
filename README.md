@@ -69,6 +69,15 @@ upload thumbnails. The Compose overlay supplies the shared WSI capability
 secret to the portal and tile server, but it does not replace the upstream
 artifact batch.
 
+The ClickHouse hydration command performs a read-only `CHECK GRANT` preflight
+before it scans Databricks or deletes any existing rows. The import role must
+have SELECT on the cohort tables, INSERT and `ALTER DELETE` on the WSI and
+pathology-event tables, and TRUNCATE/OPTIMIZE plus INSERT on the derived-table
+rebuild inputs/outputs. If a privilege is missing, the command prints the
+exact `GRANT` statements needed and leaves the database untouched.
+`--allow-incomplete-assets` is retained only as an explicit diagnostic escape
+hatch; it is never valid for a release accepted by the verification gate.
+
 After importing a release, run the catalog-wide acceptance gate from the stack
 host before testing it in the browser. Container health checks only prove that
 processes are running; this gate proves that the portal catalog and every
@@ -103,12 +112,13 @@ scripts/verify-stack-release.sh
 
 The gate requires an exact catalog/manifest match, checks every patient
 hierarchy and every slide association, compares WSI clinical counts with
-ClickHouse, and samples three real servable slides per study (early, middle,
-late; preferring distinct patients) through access, thumbnail, and tile
-requests. Set `VERIFY_ALL_TILES=1` for a pixel request for every servable
-slide. The portal's live `config_service` tile URL is authoritative; the
-expected URL is only an optional deployment assertion. Cross-origin requests
-also require a matching CORS preflight for the portal origin.
+ClickHouse, and exercises every servable access bundle (including its
+thumbnail). It samples three real servable slides per study (early, middle,
+late; preferring distinct patients) for pixel tile requests; set
+`VERIFY_ALL_TILES=1` for a pixel request for every servable slide. The portal's
+live `config_service` tile URL is authoritative; the expected URL is only an
+optional deployment assertion. Cross-origin requests also require a matching
+CORS preflight for the portal origin.
 
 For a focused diagnosis of one study, use the per-study wrapper. It enables
 the complete study, timeline, hierarchy, access-bundle, clinical-count, and
@@ -211,11 +221,12 @@ This command stages the study with hard links, invokes
 `export_databricks_wsi_snapshot.py` against the configured Databricks SQL
 warehouse and canonical/thumbnail tables, validates the Databricks manifest,
 and then runs the portal, ClickHouse, WSI hierarchy, clinical-count,
-access-bundle, thumbnail, and tile checks against that exact staged snapshot.
+complete access-bundle, thumbnail, and tile checks against that exact staged
+snapshot.
 The source study directory and Databricks tables are never modified. The
-default run checks every patient hierarchy and three real slides; set
-`VERIFY_ALL_ACCESS=1` for every servable access bundle and
-`VERIFY_ALL_TILES=1` for a tile request for each of them. Set
+default run checks every patient hierarchy, every servable access bundle, and
+three real slides; set `VERIFY_ALL_ACCESS=0` only for a bounded diagnostic
+run. Set `VERIFY_ALL_TILES=1` for a tile request for each servable slide. Set
 `KEEP_E2E_STAGE=1` to retain the generated snapshot for diagnosis.
 
 The exporter uses `WSI_ALLOWED_SOURCE_PREFIXES` as its S3 source policy. Set it

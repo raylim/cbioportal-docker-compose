@@ -16,6 +16,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent
 E2E_SCRIPT = (ROOT / "verify-databricks-wsi-e2e.sh").read_text()
 STACK_SCRIPT = (ROOT / "verify-stack-release.sh").read_text()
+HYDRATE_SCRIPT = (ROOT / "hydrate_databricks_wsi_clickhouse.py").read_text()
 
 
 def _load(name: str, path: Path):
@@ -33,6 +34,10 @@ EXPORT = _load("export_databricks_wsi_snapshot", ROOT / "export_databricks_wsi_s
 RECONCILE = _load(
     "reconcile_pathology_timeline_capabilities",
     ROOT / "reconcile_pathology_timeline_capabilities.py",
+)
+HYDRATE = _load(
+    "hydrate_databricks_wsi_clickhouse",
+    ROOT / "hydrate_databricks_wsi_clickhouse.py",
 )
 
 
@@ -52,6 +57,56 @@ class PortalTileContractTests(unittest.TestCase):
             'args+=(--timeline-patient-sample "${TIMELINE_PATIENT_SAMPLE:-24}")',
             STACK_SCRIPT,
         )
+
+    def test_hydration_is_strict_by_default(self):
+        self.assertIn('"--allow-incomplete-assets"', HYDRATE_SCRIPT)
+        self.assertIn(
+            "require_complete_assets=not args.allow_incomplete_assets",
+            HYDRATE_SCRIPT,
+        )
+        self.assertIn('VERIFY_ALL_ACCESS:-1', E2E_SCRIPT)
+
+    def test_hydration_checks_permissions_before_mutating(self):
+        args = Namespace(database="cbioportal_msk_beta", import_role="beta_wsi_import_role")
+        with mock.patch.object(
+            HYDRATE,
+            "_query_rows",
+            side_effect=lambda _args, query: [["0"]]
+            if "clinical_event" in query
+            else [["1"]],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "complete WSI hydration"):
+                HYDRATE._check_import_permissions(args)
+
+    def test_release_gate_requests_every_access_bundle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            study_dir = Path(temporary)
+            (study_dir / "meta_wsi.txt").write_text(
+                "cancer_study_identifier: study_a\n", encoding="utf-8"
+            )
+            args = Namespace(
+                portal_url="https://portal.example.test",
+                clickhouse_container="clickhouse",
+                clickhouse_user="cbio_user",
+                clickhouse_database="cbioportal",
+                timeline_patient_sample=24,
+                wsi_sample_size=3,
+                expected_tile_url="",
+                cookie="",
+                study_timeout_seconds=60,
+            )
+            completed = mock.Mock(stdout=json.dumps({"status": "accepted"}))
+            study = {
+                "study_id": "study_a",
+                "study_dir": str(study_dir),
+                "timeline_dir": str(study_dir),
+                "declared_files": [],
+            }
+            with mock.patch.object(STACK.subprocess, "run", return_value=completed) as run:
+                STACK._verify_study(args, study, check_all_tiles=False)
+            command = run.call_args.args[0]
+            self.assertIn("--check-all-access", command)
+            self.assertNotIn("--check-access", command)
 
     def test_portal_config_is_authoritative_and_cross_origin_is_preflighted(self):
         args = Namespace(cookie="", expected_tile_url="https://tiles.example.test/")
