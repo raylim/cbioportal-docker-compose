@@ -147,10 +147,10 @@ def _read_manifest(path: Path) -> list[dict[str, Any]]:
             timeline_path / "meta_clinical_timeline_pathology_slides.txt",
             timeline_path / "data_clinical_timeline_pathology_slides.txt",
         ]
-        if any(path.is_file() for path in timeline_files) and not all(
-            path.is_file() for path in timeline_files
-        ):
-            raise VerificationError(f"study {study_id} has an incomplete pathology timeline")
+        if not all(path.is_file() for path in timeline_files):
+            if any(path.is_file() for path in timeline_files):
+                raise VerificationError(f"study {study_id} has an incomplete pathology timeline")
+            raise VerificationError(f"study {study_id} is missing the pathology timeline")
         if timeline_path != directory and all(path.is_file() for path in timeline_files):
             _validate_declared_sources(timeline_path, study_id)
         seen.add(study_id)

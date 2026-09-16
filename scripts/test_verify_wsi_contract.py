@@ -41,6 +41,17 @@ HYDRATE = _load(
 )
 
 
+def _write_timeline_pair(directory: Path) -> None:
+    (directory / "meta_clinical_timeline_pathology_slides.txt").write_text(
+        "cancer_study_identifier: study_a\n"
+        "data_filename: data_clinical_timeline_pathology_slides.txt\n",
+        encoding="utf-8",
+    )
+    (directory / "data_clinical_timeline_pathology_slides.txt").write_text(
+        "PATIENT_ID\tSTART_DATE\tEVENT_TYPE\n", encoding="utf-8"
+    )
+
+
 class PortalTileContractTests(unittest.TestCase):
     def test_release_verifiers_use_dev_tables_and_bound_event_requests(self):
         self.assertIn('databricks_target="${DATABRICKS_TARGET:-dev}"', E2E_SCRIPT)
@@ -466,6 +477,9 @@ class ReleaseManifestTests(unittest.TestCase):
                 json.dumps({"version": 1, "studies": [{"study_id": "study_a", "study_dir": str(study_dir)}]}),
                 encoding="utf-8",
             )
+            with self.assertRaisesRegex(STACK.VerificationError, "missing the pathology timeline"):
+                STACK._read_manifest(manifest)
+            _write_timeline_pair(study_dir)
             self.assertEqual(STACK._read_manifest(manifest)[0]["study_id"], "study_a")
 
             timeline_dir = Path(temporary) / "timeline"
@@ -498,6 +512,7 @@ class ReleaseManifestTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (study_dir / "data_wsi.txt").write_text("PATIENT_ID\tIMAGE_ID\nP\tI\n", encoding="utf-8")
+            _write_timeline_pair(study_dir)
             (study_dir / "wsi_snapshot_manifest.json").write_text(
                 json.dumps(
                     {
@@ -529,6 +544,7 @@ class ReleaseManifestTests(unittest.TestCase):
                 "cancer_study_identifier: study_a\ndata_filename: data_wsi.txt\n", encoding="utf-8"
             )
             (study_dir / "data_wsi.txt").write_text("PATIENT_ID\tIMAGE_ID\nP\tI\n", encoding="utf-8")
+            _write_timeline_pair(study_dir)
             (study_dir / "wsi_snapshot_manifest.json").write_text(
                 json.dumps(
                     {
@@ -557,6 +573,7 @@ class ReleaseManifestTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (study_dir / "data_wsi.txt").write_text("PATIENT_ID\tIMAGE_ID\nP\tI\n", encoding="utf-8")
+            _write_timeline_pair(study_dir)
             (study_dir / "wsi_snapshot_manifest.json").write_text(
                 json.dumps(
                     {
@@ -586,6 +603,7 @@ class ReleaseManifestTests(unittest.TestCase):
                 "cancer_study_identifier: study_a\ndata_filename: data_wsi.txt\n", encoding="utf-8"
             )
             (study_dir / "data_wsi.txt").write_text("PATIENT_ID\tIMAGE_ID\nP\tI\n", encoding="utf-8")
+            _write_timeline_pair(study_dir)
             (study_dir / "meta_mutations.txt").write_text(
                 "cancer_study_identifier: study_a\ndata_filename: data_mutations.txt\n", encoding="utf-8"
             )
