@@ -55,8 +55,8 @@ The default run checks every WSI patient hierarchy and every servable access
 bundle (including thumbnails), every event-bearing patient, and three real tile
 paths. Set TIMELINE_PATIENT_SAMPLE to a positive value only for a bounded
 diagnostic run. Set
-VERIFY_ALL_ACCESS=0 only for a bounded diagnostic run;
-VERIFY_ALL_TILES=1 additionally checks pixel tiles.
+VERIFY_ALL_ACCESS=0 only for a bounded diagnostic run; VERIFY_ALL_TILES=1
+additionally checks pixel tiles.
 USAGE
   exit 0
 fi
