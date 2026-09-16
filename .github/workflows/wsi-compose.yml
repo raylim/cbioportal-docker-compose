@@ -11,6 +11,7 @@ on:
       - 'scripts/verify-wsi-release.sh'
       - 'scripts/verify-databricks-wsi-e2e.sh'
       - 'scripts/hydrate_databricks_wsi_clickhouse.py'
+      - 'scripts/print-wsi-import-grants.sh'
       - 'scripts/verify-stack-release.py'
       - 'scripts/verify-stack-release.sh'
       - 'scripts/test_verify_wsi_contract.py'
@@ -28,6 +29,7 @@ on:
       - 'scripts/verify-wsi-release.sh'
       - 'scripts/verify-databricks-wsi-e2e.sh'
       - 'scripts/hydrate_databricks_wsi_clickhouse.py'
+      - 'scripts/print-wsi-import-grants.sh'
       - 'scripts/verify-stack-release.py'
       - 'scripts/verify-stack-release.sh'
       - 'scripts/test_verify_wsi_contract.py'
@@ -53,11 +55,13 @@ jobs:
           bash -n scripts/verify-wsi-release.sh
           bash -n scripts/verify-databricks-wsi-e2e.sh
           bash -n scripts/verify-stack-release.sh
+          bash -n scripts/print-wsi-import-grants.sh
           python3 -m py_compile scripts/verify-study-load.py
           python3 -m py_compile scripts/verify-stack-release.py
           python3 -m py_compile scripts/hydrate_databricks_wsi_clickhouse.py
           python3 -m py_compile scripts/reconcile_pathology_timeline_capabilities.py
           python3 scripts/test_verify_wsi_contract.py
+          test "$(scripts/print-wsi-import-grants.sh test_db test_role | wc -l)" -eq 55
           ./scripts/verify-wsi-release.sh --help
           ./scripts/verify-databricks-wsi-e2e.sh --help
           ./scripts/verify-stack-release.sh --help

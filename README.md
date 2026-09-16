@@ -77,6 +77,9 @@ rebuild inputs/outputs. If a privilege is missing, the command prints the
 exact `GRANT` statements needed and leaves the database untouched.
 `--allow-incomplete-assets` is retained only as an explicit diagnostic escape
 hatch; it is never valid for a release accepted by the verification gate.
+An administrator can generate the complete grant set with
+`scripts/print-wsi-import-grants.sh <database> <role>` and review it before
+applying it in the ClickHouse console.
 
 After importing a release, run the catalog-wide acceptance gate from the stack
 host before testing it in the browser. Container health checks only prove that
