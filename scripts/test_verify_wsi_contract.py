@@ -49,7 +49,7 @@ def _write_timeline_pair(directory: Path) -> None:
         encoding="utf-8",
     )
     (directory / "data_clinical_timeline_pathology_slides.txt").write_text(
-        "PATIENT_ID\tSTART_DATE\tEVENT_TYPE\n", encoding="utf-8"
+        "PATIENT_ID\tSTART_DATE\tEVENT_TYPE\tIMAGE_IDS\n", encoding="utf-8"
     )
 
 
@@ -85,6 +85,7 @@ class PortalTileContractTests(unittest.TestCase):
         self.assertIn("ALTER TABLE structural_variant DELETE", MOLECULAR_HYDRATE_SCRIPT)
         self.assertIn("ImportCopyNumberSegmentData", MOLECULAR_HYDRATE_SCRIPT)
         self.assertIn("ImportGenePanelProfileMap", MOLECULAR_HYDRATE_SCRIPT)
+        self.assertIn('(\"IMAGE_IDS\", json.dumps(sorted(group[\"images\"])))', HYDRATE_SCRIPT)
         self.assertIn('profile_id "$mutation_meta" MUTATION_EXTENDED', MOLECULAR_HYDRATE_SCRIPT)
         self.assertIn('stable_id = \'$stable_id\'', MOLECULAR_HYDRATE_SCRIPT)
         self.assertNotIn("VERIFY_AFTER_HYDRATION", MOLECULAR_HYDRATE_SCRIPT)
@@ -757,8 +758,8 @@ class TimelineRepairTests(unittest.TestCase):
             )
             timeline = root / "data_clinical_timeline_pathology_slides.txt"
             timeline.write_text(
-                "PATIENT_ID\tSTART_DATE\tEVENT_TYPE\tIMAGE_COUNT\tNON_SERVABLE_IMAGE_COUNT\tTOTAL_IMAGE_COUNT\tLINKOUT\n"
-                "P-1\t0\tPATHOLOGY SLIDES\t1\t0\t1\t"
+                "PATIENT_ID\tSTART_DATE\tEVENT_TYPE\tIMAGE_COUNT\tNON_SERVABLE_IMAGE_COUNT\tTOTAL_IMAGE_COUNT\tIMAGE_IDS\tLINKOUT\n"
+                "P-1\t0\tPATHOLOGY SLIDES\t1\t0\t1\t[\"slide-1\"]\t"
                 "/patient/wsiHESlides?caseId=P-1&sampleId=S-1&stainFilter=hne&"
                 "matchLevel=BLOCK&specimenKey=block%3A%3Apart%3A1%3A%3Ablock%3AA1\n",
                 encoding="utf-8",
@@ -783,8 +784,8 @@ class TimelineRepairTests(unittest.TestCase):
             )
             timeline = root / "data_clinical_timeline_pathology_slides.txt"
             timeline.write_text(
-                "PATIENT_ID\tSTART_DATE\tEVENT_TYPE\tIMAGE_COUNT\tNON_SERVABLE_IMAGE_COUNT\tTOTAL_IMAGE_COUNT\tLINKOUT\n"
-                "P-1\t0\tPATHOLOGY SLIDES\t1\t0\t1\t"
+                "PATIENT_ID\tSTART_DATE\tEVENT_TYPE\tIMAGE_COUNT\tNON_SERVABLE_IMAGE_COUNT\tTOTAL_IMAGE_COUNT\tIMAGE_IDS\tLINKOUT\n"
+                "P-1\t0\tPATHOLOGY SLIDES\t1\t0\t1\t[\"slide-1\"]\t"
                 "/patient/wsiHESlides?caseId=P-1&stainFilter=hne&matchLevel=BLOCK&"
                 "specimenKey=block%3A%3Apart%3A1%3A%3Ablock%3AA1\n",
                 encoding="utf-8",

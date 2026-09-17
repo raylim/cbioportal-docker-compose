@@ -579,7 +579,12 @@ def _timeline_from_slides(db: sqlite3.Connection, study_stable_by_id: dict[int, 
                 ("SPECIMEN", specimen), ("IMAGE_COUNT", str(servable_count)),
                 ("NON_SERVABLE_IMAGE_COUNT", str(nonservable_count)),
                 ("TOTAL_IMAGE_COUNT", str(servable_count + nonservable_count)),
-                ("TIMEPOINT_SOURCE", ", ".join(sorted(group["sources"]))), ("LINKOUT", linkout)]
+                ("TIMEPOINT_SOURCE", ", ".join(sorted(group["sources"]))),
+                # Keep the exact slide membership alongside the aggregate counts.
+                # The release contract and verifier use this to prevent a stale
+                # count from silently representing a different set of slides.
+                ("IMAGE_IDS", json.dumps(sorted(group["images"]))),
+                ("LINKOUT", linkout)]
         events.append((study, group["patient"], start, None, "PATHOLOGY SLIDES", data))
     return events
 

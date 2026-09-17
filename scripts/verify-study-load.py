@@ -590,6 +590,7 @@ def _parse_timeline_file(study_dir: Path) -> dict[str, Any]:
             "IMAGE_COUNT",
             "NON_SERVABLE_IMAGE_COUNT",
             "TOTAL_IMAGE_COUNT",
+            "IMAGE_IDS",
             "LINKOUT",
         }
         if not reader.fieldnames or not required.issubset(reader.fieldnames):
@@ -605,6 +606,19 @@ def _parse_timeline_file(study_dir: Path) -> dict[str, Any]:
                 raise VerificationError("pathology timeline contains a non-numeric image count") from None
             if image_count < 0 or non_servable < 0 or total != image_count + non_servable:
                 raise VerificationError("pathology timeline image counts are inconsistent")
+            try:
+                image_ids = json.loads(row.get("IMAGE_IDS") or "")
+            except json.JSONDecodeError:
+                raise VerificationError("pathology timeline IMAGE_IDS is not valid JSON") from None
+            if (
+                not isinstance(image_ids, list)
+                or any(not isinstance(image_id, str) or not image_id for image_id in image_ids)
+                or image_ids != sorted(set(image_ids))
+                or len(image_ids) != total
+            ):
+                raise VerificationError(
+                    "pathology timeline IMAGE_IDS must be a sorted unique list matching TOTAL_IMAGE_COUNT"
+                )
             rows.append((image_count, non_servable, total, bool(row.get("LINKOUT"))))
             patient_id = str(row["PATIENT_ID"])
             patient_total_image_counts[patient_id] += total
