@@ -21,13 +21,11 @@ Optional environment:
   CLICKHOUSE_HTTP_PORT      default: 19225
   PORTAL_HOME               default: ../cbioportal/target/classes
   JAVA_BIN                  default: java
-  PORTAL_URL                default: http://localhost:8080
-  VERIFY_AFTER_HYDRATION    default: 1; set to 0 only for a diagnostic run
 
-The caller must stop the portal before running this command and restart it
-before the post-hydration verifier runs. The command bulk-replaces the five
-molecular categories and rebuilds ClickHouse derived tables. It intentionally
-does not use the importer’s per-sample --overwrite-existing mode.
+Stop the portal before running this command. After it completes, restart the
+portal and run verify-study-load.py separately. The command bulk-replaces the
+five molecular categories and rebuilds ClickHouse derived tables. It
+intentionally does not use the importer’s per-sample --overwrite-existing mode.
 USAGE
 }
 
@@ -132,20 +130,45 @@ docker_ch() {
 }
 
 profile_id() {
-  local alteration_type="$1"
-  docker_ch --format Raw --query \
-    "SELECT genetic_profile_id FROM genetic_profile WHERE cancer_study_id = (SELECT cancer_study_id FROM cancer_study WHERE cancer_study_identifier = '$study_id') AND genetic_alteration_type = '$alteration_type' LIMIT 1"
+  local meta="$1" alteration_type="$2" stable_id datatype profile_info profile_count profile
+  stable_id="$(metadata_value "$meta" stable_id)"
+  datatype="$(metadata_value "$meta" datatype)"
+  [[ -n "$stable_id" && -n "$datatype" ]] || {
+    echo "$(basename "$meta") must define stable_id and datatype" >&2
+    exit 1
+  }
+  if [[ "$stable_id" != "${study_id}_"* ]]; then
+    stable_id="${study_id}_${stable_id}"
+  fi
+  [[ "$stable_id" =~ ^[A-Za-z0-9_.-]+$ && "$datatype" =~ ^[A-Za-z0-9_.-]+$ ]] || {
+    echo "unsupported profile identifier in $(basename "$meta")" >&2
+    exit 1
+  }
+  profile_info="$(docker_ch --format TSVRaw --query \
+    "SELECT toString(count()), toString(any(genetic_profile_id)) FROM genetic_profile WHERE cancer_study_id = $study_numeric_id AND stable_id = '$stable_id' AND genetic_alteration_type = '$alteration_type' AND datatype = '$datatype'")"
+  read -r profile_count profile <<< "$profile_info"
+  [[ "$profile_count" == "1" && "$profile" =~ ^[0-9]+$ ]] || {
+    echo "metadata $(basename "$meta") does not resolve to exactly one profile: $stable_id" >&2
+    exit 1
+  }
+  printf '%s\n' "$profile"
 }
 
 study_numeric_id="$(docker_ch --format Raw --query "SELECT cancer_study_id FROM cancer_study WHERE cancer_study_identifier = '$study_id' LIMIT 1")"
 [[ -n "$study_numeric_id" ]] || { echo "study is not present in ClickHouse: $study_id" >&2; exit 1; }
-mutation_profile="$(profile_id MUTATION_EXTENDED)"
-cna_profile="$(profile_id COPY_NUMBER_ALTERATION)"
-sv_profile="$(profile_id STRUCTURAL_VARIANT)"
+derived_sql="$portal_home/db-scripts/clickhouse/populate_derived_tables.sql"
+[[ -f "$derived_sql" ]] || { echo "derived-table SQL does not exist: $derived_sql" >&2; exit 1; }
+mutation_profile="$(profile_id "$mutation_meta" MUTATION_EXTENDED)"
+cna_profile="$(profile_id "$cna_meta" COPY_NUMBER_ALTERATION)"
+sv_profile="$(profile_id "$sv_meta" STRUCTURAL_VARIANT)"
 [[ -n "$mutation_profile" && -n "$cna_profile" && -n "$sv_profile" ]] || {
   echo "study is missing one or more required molecular profiles" >&2
   exit 1
 }
+if [[ "$mutation_profile" == "$cna_profile" || "$mutation_profile" == "$sv_profile" || "$cna_profile" == "$sv_profile" ]]; then
+  echo "molecular metadata resolved to duplicate profile IDs" >&2
+  exit 1
+fi
 
 echo "Replacing molecular data for $study_id (study id $study_numeric_id)"
 docker_ch --mutations_sync 2 --query "ALTER TABLE mutation DELETE WHERE genetic_profile_id = $mutation_profile"
@@ -173,19 +196,8 @@ run_java org.mskcc.cbio.portal.scripts.ImportCopyNumberSegmentData \
 run_java org.mskcc.cbio.portal.scripts.ImportGenePanelProfileMap \
   --meta "$panel_meta" --data "$panel_data" --noprogress
 
-derived_sql="$portal_home/db-scripts/clickhouse/populate_derived_tables.sql"
-[[ -f "$derived_sql" ]] || { echo "derived-table SQL does not exist: $derived_sql" >&2; exit 1; }
 docker exec -i "$clickhouse_container" clickhouse-client --user "$clickhouse_user" \
   --password "$CLICKHOUSE_PASSWORD" --database "$clickhouse_db" --multiquery \
   --param_optimize_backoff_secs=0 < "$derived_sql"
 
-if [[ "${VERIFY_AFTER_HYDRATION:-1}" == "1" ]]; then
-  python3 "$ROOT_DIR/scripts/verify-study-load.py" \
-    --portal-url "${PORTAL_URL:-http://localhost:8080}" \
-    --study-id "$study_id" --study-dir "$study_dir" \
-    --clickhouse-container "$clickhouse_container" \
-    --clickhouse-user "$clickhouse_user" --clickhouse-database "$clickhouse_db" \
-    --check-all-data --skip-wsi-checks
-fi
-
-echo "molecular hydration accepted for $study_id"
+echo "molecular hydration complete for $study_id; restart the portal and run verify-study-load.py"

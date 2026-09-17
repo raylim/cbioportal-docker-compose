@@ -85,7 +85,42 @@ class PortalTileContractTests(unittest.TestCase):
         self.assertIn("ALTER TABLE structural_variant DELETE", MOLECULAR_HYDRATE_SCRIPT)
         self.assertIn("ImportCopyNumberSegmentData", MOLECULAR_HYDRATE_SCRIPT)
         self.assertIn("ImportGenePanelProfileMap", MOLECULAR_HYDRATE_SCRIPT)
+        self.assertIn('profile_id "$mutation_meta" MUTATION_EXTENDED', MOLECULAR_HYDRATE_SCRIPT)
+        self.assertIn('stable_id = \'$stable_id\'', MOLECULAR_HYDRATE_SCRIPT)
+        self.assertNotIn("VERIFY_AFTER_HYDRATION", MOLECULAR_HYDRATE_SCRIPT)
         self.assertNotIn("--overwrite-existing --meta", MOLECULAR_HYDRATE_SCRIPT)
+
+    def test_gene_alias_map_preserves_ambiguous_aliases(self):
+        with mock.patch.object(
+            VERIFY,
+            "_clickhouse_query",
+            side_effect=[
+                [["1", "CANONICAL"], ["2", "SHARED"]],
+                [["3", "SHARED"], ["4", "ALIAS"], ["5", "ALIAS"]],
+            ],
+        ):
+            symbols = VERIFY._gene_symbol_map(Namespace())
+        self.assertEqual(symbols["SHARED"], {2})
+        self.assertEqual(symbols["ALIAS"], {4, 5})
+
+    def test_profile_lookup_uses_metadata_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            meta = Path(temporary) / "meta_mutations.txt"
+            meta.write_text(
+                "stable_id: mutations\n"
+                "genetic_alteration_type: MUTATION_EXTENDED\n"
+                "datatype: MAF\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                VERIFY, "_clickhouse_query", return_value=[["25"]]
+            ) as query:
+                profile_id = VERIFY._profile_id(Namespace(), "study_a", meta)
+        self.assertEqual(profile_id, 25)
+        sql = query.call_args.args[1]
+        self.assertIn("stable_id = 'study_a_mutations'", sql)
+        self.assertIn("genetic_alteration_type = 'MUTATION_EXTENDED'", sql)
+        self.assertIn("datatype = 'MAF'", sql)
 
     def test_hydration_checks_permissions_before_mutating(self):
         args = Namespace(database="cbioportal_msk_beta", import_role="beta_wsi_import_role")

@@ -932,6 +932,7 @@ def _gene_symbol_map(args: argparse.Namespace) -> dict[str, set[int]]:
         timeout=120,
     )
     symbols: dict[str, set[int]] = {}
+    canonical_symbols: set[str] = set()
     for row in canonical_rows:
         if len(row) != 2:
             continue
@@ -939,38 +940,81 @@ def _gene_symbol_map(args: argparse.Namespace) -> dict[str, set[int]]:
             entrez = int(row[0])
         except ValueError:
             continue
-        symbols.setdefault(row[1].upper(), set()).add(entrez)
+        symbol = row[1].upper()
+        canonical_symbols.add(symbol)
+        symbols.setdefault(symbol, set()).add(entrez)
     for row in alias_rows:
         if len(row) != 2:
             continue
         # DaoGeneOptimized resolves an exact canonical symbol before looking
         # at aliases. Preserve that precedence so source-count expectations
         # match the importer rather than treating common aliases as ambiguous.
-        if row[1].upper() in symbols:
+        symbol = row[1].upper()
+        if symbol in canonical_symbols:
             continue
         try:
             entrez = int(row[0])
         except ValueError:
             continue
-        symbols.setdefault(row[1].upper(), set()).add(entrez)
+        symbols.setdefault(symbol, set()).add(entrez)
     return symbols
 
 
-def _profile_id(args: argparse.Namespace, study_id: str, alteration_type: str) -> int:
-    escaped = study_id.replace("'", "''")
+def _profile_id(
+    args: argparse.Namespace,
+    study_id: str,
+    meta_path: Path,
+) -> int:
+    stable_id = _meta_value(meta_path, "stable_id")
+    alteration_type = _meta_value(meta_path, "genetic_alteration_type")
+    datatype = _meta_value(meta_path, "datatype")
+    if not stable_id or not alteration_type or not datatype:
+        raise VerificationError(
+            f"{meta_path.name} must define stable_id, genetic_alteration_type, and datatype"
+        )
+    if not stable_id.startswith(study_id + "_"):
+        stable_id = f"{study_id}_{stable_id}"
+    escaped_study_id = study_id.replace("'", "''")
+    escaped_stable_id = stable_id.replace("'", "''")
+    escaped_alteration_type = alteration_type.replace("'", "''")
+    escaped_datatype = datatype.replace("'", "''")
     rows = _clickhouse_query(
         args,
         "SELECT toString(genetic_profile_id) FROM genetic_profile "
         f"WHERE cancer_study_id = (SELECT cancer_study_id FROM cancer_study "
-        f"WHERE cancer_study_identifier = '{escaped}') "
-        f"AND genetic_alteration_type = '{alteration_type}' LIMIT 1",
+        f"WHERE cancer_study_identifier = '{escaped_study_id}') "
+        f"AND stable_id = '{escaped_stable_id}' "
+        f"AND genetic_alteration_type = '{escaped_alteration_type}' "
+        f"AND datatype = '{escaped_datatype}'",
     )
-    if not rows or not rows[0]:
-        raise VerificationError(f"study is missing its {alteration_type} molecular profile")
+    if len(rows) != 1 or not rows[0]:
+        raise VerificationError(
+            f"{meta_path.name} does not resolve to exactly one molecular profile: {stable_id}"
+        )
     try:
         return int(rows[0][0])
     except ValueError:
         raise VerificationError(f"invalid {alteration_type} molecular profile id") from None
+
+
+def _resolve_sv_gene_id(
+    row: dict[str, str],
+    symbol_key: str,
+    entrez_key: str,
+    gene_symbols: dict[str, set[int]],
+    gene_ids: set[int],
+) -> int | None:
+    """Mirror ImportStructuralVariantData's Entrez-then-unambiguous-symbol lookup."""
+    raw_entrez = (row.get(entrez_key) or "").strip()
+    if raw_entrez and raw_entrez.upper() not in {"NA", "N/A"}:
+        try:
+            entrez_id = int(raw_entrez)
+        except ValueError:
+            entrez_id = 0
+        if entrez_id in gene_ids:
+            return entrez_id
+    symbol_ids = gene_symbols.get((row.get(symbol_key) or "").strip().upper(), set())
+    return next(iter(symbol_ids)) if len(symbol_ids) == 1 else None
 
 
 def _study_data_snapshot(args: argparse.Namespace, study_id: str, study_dir: Path) -> dict[str, Any]:
@@ -1080,30 +1124,28 @@ def _study_data_snapshot(args: argparse.Namespace, study_id: str, study_dir: Pat
         sample = (row.get("Sample_Id") or "").strip()
         site1 = (row.get("Site1_Hugo_Symbol") or "").strip()
         site2 = (row.get("Site2_Hugo_Symbol") or "").strip()
-        site1_ids = gene_symbols.get(site1.upper(), set())
-        site2_ids = gene_symbols.get(site2.upper(), set())
-        if not site1_ids and not site2_ids:
+        site1_gene_id = _resolve_sv_gene_id(
+            row, "Site1_Hugo_Symbol", "Site1_Entrez_Gene_Id", gene_symbols, gene_ids
+        )
+        site2_gene_id = _resolve_sv_gene_id(
+            row, "Site2_Hugo_Symbol", "Site2_Entrez_Gene_Id", gene_symbols, gene_ids
+        )
+        if site1_gene_id is None and site2_gene_id is None:
             sv_unresolved_rows += 1
             sv_unresolved_symbols.update(symbol for symbol in (site1, site2) if symbol)
             continue
         if sample:
             sv_samples.add(sample)
 
-        def normalized_site(symbol: str, key: str) -> str:
-            ids = gene_symbols.get(symbol.upper(), set())
-            # ImportStructuralVariantData resolves an unambiguous symbol to
-            # its canonical Entrez ID before constructing its duplicate key.
-            return str(next(iter(ids))) if len(ids) == 1 else key
-
         sv_keys.add(
             (
                 sample,
-                normalized_site(site1, "null"),
+                str(site1_gene_id) if site1_gene_id is not None else "null",
                 (row.get("Site1_Chromosome") or "").strip(),
                 (row.get("Site1_Position") or "").strip() or "NA",
                 (row.get("Site1_Region_Number") or "").strip() or "NA",
                 (row.get("Site1_Ensembl_Transcript_Id") or "").strip() or "NA",
-                normalized_site(site2, "null"),
+                str(site2_gene_id) if site2_gene_id is not None else "null",
                 (row.get("Site2_Chromosome") or "").strip(),
                 (row.get("Site2_Position") or "").strip() or "NA",
                 (row.get("Site2_Region_Number") or "").strip() or "NA",
@@ -1158,9 +1200,9 @@ def _study_data_snapshot(args: argparse.Namespace, study_id: str, study_dir: Pat
             1 for _ in _tabular_rows(_data_file(study_dir, resource_patient_meta.name))
         )
 
-    mutation_profile = _profile_id(args, study_id, "MUTATION_EXTENDED")
-    cna_profile = _profile_id(args, study_id, "COPY_NUMBER_ALTERATION")
-    sv_profile = _profile_id(args, study_id, "STRUCTURAL_VARIANT")
+    mutation_profile = _profile_id(args, study_id, mutation_meta)
+    cna_profile = _profile_id(args, study_id, cna_meta)
+    sv_profile = _profile_id(args, study_id, sv_meta)
     profile_ids = f"{mutation_profile},{cna_profile},{sv_profile}"
     db_rows = _clickhouse_query(
         args,
