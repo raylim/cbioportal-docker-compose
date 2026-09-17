@@ -55,6 +55,8 @@ def _write_timeline_pair(directory: Path) -> None:
 
 class PortalTileContractTests(unittest.TestCase):
     def test_release_verifiers_use_dev_tables_and_bound_event_requests(self):
+        self.assertIn("WSI_TILE_SERVER_ROOT", HYDRATE_SCRIPT)
+        self.assertIn("WSI_TILE_SERVER_ROOT", (ROOT / "export_databricks_wsi_snapshot.py").read_text())
         self.assertIn('databricks_target="${DATABRICKS_TARGET:-dev}"', E2E_SCRIPT)
         self.assertIn(
             'canonical_default="cdsi_prod.pathology_data_mining_dev.canonical_slide_associations"',

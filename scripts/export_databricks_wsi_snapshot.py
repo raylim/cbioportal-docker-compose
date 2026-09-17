@@ -38,7 +38,12 @@ from urllib.parse import urlparse
 # exporter and the standalone timeline exporter share exactly the same
 # grouping, de-identification, and linkout rules.  Keep this import optional
 # for callers that only use the pure WSI row helpers in a compose checkout.
-_TILE_SERVER_ROOT = Path(__file__).resolve().parents[2] / "cbioportal-tile-server"
+_TILE_SERVER_ROOT = Path(
+    os.environ.get(
+        "WSI_TILE_SERVER_ROOT",
+        str(Path(__file__).resolve().parents[2] / "cbioportal-tile-server"),
+    )
+).resolve()
 if _TILE_SERVER_ROOT.is_dir() and str(_TILE_SERVER_ROOT) not in sys.path:
     sys.path.insert(0, str(_TILE_SERVER_ROOT))
 try:  # pragma: no cover - exercised by the integration exporter

@@ -32,6 +32,15 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+_TILE_SERVER_ROOT = Path(
+    os.environ.get(
+        "WSI_TILE_SERVER_ROOT",
+        str(Path(__file__).resolve().parents[2] / "cbioportal-tile-server"),
+    )
+).resolve()
+if _TILE_SERVER_ROOT.is_dir() and str(_TILE_SERVER_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TILE_SERVER_ROOT))
+
 import export_databricks_wsi_snapshot as exporter  # noqa: E402
 
 _TIMELINE_MODULE = None
