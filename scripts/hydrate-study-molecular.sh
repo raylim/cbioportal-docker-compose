@@ -21,6 +21,8 @@ Optional environment:
   CLICKHOUSE_HTTP_PORT      default: 19225
   PORTAL_HOME               default: ../cbioportal/target/classes
   JAVA_BIN                  default: java
+  MAINTENANCE_CONFIRMED     must be 1; prevents rebuilding while traffic is live
+  DERIVED_TABLE_RECEIPT      optional path for the completion receipt
 
 Stop the portal before running this command. After it completes, restart the
 portal and run verify-study-load.py separately. The command bulk-replaces the
@@ -60,6 +62,10 @@ fi
 if [[ -z "${CLICKHOUSE_PASSWORD:-}" ]]; then
   echo "CLICKHOUSE_PASSWORD is required" >&2
   exit 2
+fi
+if [[ "${MAINTENANCE_CONFIRMED:-}" != "1" ]]; then
+  echo "set MAINTENANCE_CONFIRMED=1 after stopping all portal consumers" >&2
+  exit 1
 fi
 
 clickhouse_user="${CLICKHOUSE_USER:-cbio_user}"
@@ -199,5 +205,37 @@ run_java org.mskcc.cbio.portal.scripts.ImportGenePanelProfileMap \
 docker exec -i "$clickhouse_container" clickhouse-client --user "$clickhouse_user" \
   --password "$CLICKHOUSE_PASSWORD" --database "$clickhouse_db" --multiquery \
   --param_optimize_backoff_secs=0 < "$derived_sql"
+
+verify_derived_pair() {
+  local source_table="$1" derived_table="$2" counts source_count derived_count
+  counts="$(docker_ch --format TSVRaw --query \
+    "SELECT toString(count()), toString((SELECT count() FROM $derived_table)) FROM $source_table")"
+  read -r source_count derived_count <<< "$counts"
+  if [[ "$source_count" =~ ^[0-9]+$ && "$derived_count" =~ ^[0-9]+$ \
+      && "$source_count" -gt 0 && "$derived_count" -eq 0 ]]; then
+    echo "derived table $derived_table is empty while $source_table has $source_count rows" >&2
+    exit 1
+  fi
+  printf '%s\t%s\t%s\n' "$source_table" "$source_count" "$derived_count"
+}
+
+receipt_path="${DERIVED_TABLE_RECEIPT:-}"
+receipt_tmp=""
+if [[ -n "$receipt_path" ]]; then
+  receipt_tmp="${receipt_path}.tmp.$$"
+  {
+    printf '{\n  "database": %s,\n  "study_id": %s,\n  "source_derived_counts": {\n' \
+      "\"$clickhouse_db\"" "\"$study_id\""
+    verify_derived_pair mutation mutation_derived | awk -F '\t' \
+      '{printf "    \"mutation\": {\"source\": %s, \"derived\": %s},\n", $2, $3}'
+    verify_derived_pair genetic_alteration genetic_alteration_derived | awk -F '\t' \
+      '{printf "    \"genetic_alteration\": {\"source\": %s, \"derived\": %s}\n", $2, $3}'
+    printf '  }\n}\n'
+  } > "$receipt_tmp"
+  mv "$receipt_tmp" "$receipt_path"
+else
+  verify_derived_pair mutation mutation_derived >/dev/null
+  verify_derived_pair genetic_alteration genetic_alteration_derived >/dev/null
+fi
 
 echo "molecular hydration complete for $study_id; restart the portal and run verify-study-load.py"
