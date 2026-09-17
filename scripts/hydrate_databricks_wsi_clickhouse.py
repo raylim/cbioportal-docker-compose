@@ -670,15 +670,20 @@ def main() -> int:
         db.close()
         # Rebuild all derived tables after WSI clinical attributes/events.
         print(f"inserted {timeline_count:,} pathology timeline events; rebuilding derived tables", flush=True)
-        migrate = Path(__file__).resolve().parents[2] / "cbioportal-prod-migration-rehearsal/src/main/resources/db-scripts/clickhouse/migrate/migrate_db.py"
-        env = os.environ.copy()
-        env["CLICKHOUSE_DB"] = args.database
-        # The migration runner uses the same config-file convention but takes
-        # its credentials from env; invoke its SQL population script directly.
-        populate = migrate.parent.parent / "populate_derived_tables.sql"
+        # Send the SQL contents to the client instead of passing a host path.
+        # The production client is often containerized, so a path visible to
+        # this process is not necessarily visible inside the ClickHouse client
+        # container.  ``--query`` also keeps this invocation compatible with
+        # the migration client wrapper used by beta and release jobs.
+        populate = (Path(__file__).resolve().parents[2]
+                    / "cbioportal-prod-migration-rehearsal/src/main/resources/db-scripts/clickhouse/populate_derived_tables.sql")
+        try:
+            populate_sql = populate.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(f"cannot read derived-table rebuild SQL: {populate}") from exc
         command = [args.clickhouse_bin, "client", "--config-file", str(args.clickhouse_config),
                    "--database", args.database, "--mutations_sync", "2", "--multiquery",
-                   "--queries-file", str(populate), "--param_optimize_backoff_secs", "0"]
+                   "--query", populate_sql, "--param_optimize_backoff_secs", "0"]
         result = subprocess.run(command, capture_output=True, text=True, check=False)
         if result.returncode:
             raise RuntimeError(f"derived-table rebuild failed: {result.stderr[-4000:]}")
