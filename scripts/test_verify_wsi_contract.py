@@ -367,6 +367,28 @@ class DatabricksExportContractTests(unittest.TestCase):
                 asset_stats={"canonical_servable": 0, "incomplete": 0},
             )
 
+    def test_export_keeps_known_failed_registry_row_as_non_servable(self):
+        record = {
+            "patient_id": "P-1",
+            "match_level": "UNMATCHED",
+            "image_id": "slide-failed",
+            "can_serve_tiles": True,
+            "registry_status": "failed",
+        }
+        stats = {"canonical_servable": 0, "incomplete": 0, "registry_failed": 0}
+        values = EXPORT._row(
+            record,
+            {"P-1"},
+            set(),
+            {},
+            require_complete_assets=True,
+            asset_stats=stats,
+        )
+        self.assertIsNotNone(values)
+        self.assertEqual(values[EXPORT.DATA_COLUMNS.index("CAN_SERVE_TILES")], "FALSE")
+        self.assertEqual(stats["registry_failed"], 1)
+        self.assertEqual(stats["incomplete"], 0)
+
     def test_export_diagnostic_escape_hatch_keeps_the_association_non_servable(self):
         record = {
             "patient_id": "P-1",

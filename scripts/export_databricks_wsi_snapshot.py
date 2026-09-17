@@ -12,8 +12,10 @@ marked servable are allowed to fail the complete-pixel contract.
 
 Exports fail closed when Databricks marks a row as tile-servable but its
 published registry record is missing source, thumbnail, or validated tile
-metadata.  Explicitly non-servable associations remain in the hierarchy with
-empty pixel fields so timeline counts and pathology provenance are preserved.
+metadata.  A registry row explicitly marked ``failed`` is retained as known
+non-servable provenance; it cannot create a broken View link. Explicitly
+non-servable associations remain in the hierarchy with empty pixel fields so
+timeline counts and pathology provenance are preserved.
 ``--allow-incomplete-assets`` is reserved for diagnostics and must not be used
 for an accepted study release.
 """
@@ -237,12 +239,12 @@ WITH ranked_registry AS (
     SELECT CAST(image_id AS STRING) AS image_id, source_path, artifact_uri,
            width, height, content_type, tile_metadata_json,
            serving_artifact_uri, serving_width, serving_height,
+           status AS registry_status,
            ROW_NUMBER() OVER (
                PARTITION BY CAST(image_id AS STRING), source_path
                ORDER BY rendered_at DESC, manifest_version DESC
            ) AS rn
     FROM {registry}
-    WHERE status = 'success'
 )
 SELECT c.patient_id, c.reference_sample_id, c.sample_id, c.match_level,
        c.image_id, c.part_key, c.part_number, c.part_designator, c.part_type,
@@ -253,7 +255,8 @@ SELECT c.patient_id, c.reference_sample_id, c.sample_id, c.match_level,
        c.timeline_start_days, c.timeline_date_status,
        NULL AS slide_timepoint_source,
        r.tile_metadata_json, r.artifact_uri, r.width, r.height,
-       r.content_type, r.serving_artifact_uri, r.serving_width, r.serving_height
+       r.content_type, r.serving_artifact_uri, r.serving_width, r.serving_height,
+       r.registry_status
 FROM {canonical} c
 LEFT JOIN ranked_registry r
   ON CAST(c.image_id AS STRING) = r.image_id
@@ -466,11 +469,14 @@ def _row(
     artifact = _text(record.get("artifact_uri")) or _text(record.get("serving_artifact_uri"))
     artifact_is_master = bool(_text(record.get("artifact_uri")))
     canonical_can_serve = str(record.get("can_serve_tiles")).lower() in {"true", "1"}
+    registry_status = _text(record.get("registry_status")).lower()
+    registry_failed = canonical_can_serve and registry_status == "failed"
     source_is_allowed = any(source.startswith(prefix) for prefix in (allowed_source_prefixes or _source_prefixes()))
     if canonical_can_serve:
         asset_stats["canonical_servable"] = asset_stats.get("canonical_servable", 0) + 1
     can_serve = (
         canonical_can_serve
+        and not registry_failed
         and source_is_allowed
         and artifact.startswith(_THUMBNAIL_PREFIX)
         and _metadata_is_safe_and_valid(tile_metadata_value)
@@ -479,7 +485,12 @@ def _row(
     # when they are matched to a BLOCK/PART.  A source may be absent from the
     # inventory, or the source may be known to be unreadable; either case is
     # represented by CAN_SERVE_TILES=FALSE and must not erase the hierarchy.
-    if require_complete_assets and canonical_can_serve and not can_serve:
+    if registry_failed:
+        # A failed thumbnail job is an explicit, known non-servable outcome,
+        # not an incomplete publication contract. Keep the association in the
+        # hierarchy/timeline while preventing a broken View link.
+        asset_stats["registry_failed"] = asset_stats.get("registry_failed", 0) + 1
+    elif require_complete_assets and canonical_can_serve and not can_serve:
         asset_stats["incomplete"] = asset_stats.get("incomplete", 0) + 1
         missing: list[str] = []
         if not source_is_allowed:
@@ -492,7 +503,7 @@ def _row(
             "canonical WSI asset contract "
             f"is incomplete for image {image}: {', '.join(missing)}"
         )
-    if canonical_can_serve and not can_serve:
+    if canonical_can_serve and not can_serve and not registry_failed:
         asset_stats["incomplete"] = asset_stats.get("incomplete", 0) + 1
     values: list[str] = []
     values.extend((_text(patient), _text(reference), _text(sample), image))
@@ -545,6 +556,7 @@ def _write(study_id: str, output_dir: Path, rows: Iterable[list[str]], stats: di
         "duplicate_association_count": stats.get("duplicates", 0),
         "canonical_servable_row_count": stats.get("canonical_servable", 0),
         "incomplete_asset_count": stats.get("incomplete", 0),
+        "registry_failed_asset_count": stats.get("registry_failed", 0),
         "cohort_rows_seen": stats.get("cohort_rows_seen", 0),
         "filtered_row_count": stats.get("filtered_rows", 0),
         "timeline_event_count": stats.get("timeline_events", 0),
@@ -591,7 +603,7 @@ def main() -> int:
     output_dir = (args.output_dir or study_dir).resolve()
     study_id, patients, samples, sample_to_patient = _read_ids(study_dir)
     output_by_image: dict[str, list[str]] = {}
-    asset_stats = {"canonical_servable": 0, "incomplete": 0}
+    asset_stats = {"canonical_servable": 0, "incomplete": 0, "registry_failed": 0}
     duplicate_count = 0
     scanned = 0
     for record in _run_export_query(
