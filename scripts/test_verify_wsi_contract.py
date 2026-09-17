@@ -75,11 +75,63 @@ class PortalTileContractTests(unittest.TestCase):
     def test_hydration_is_strict_by_default(self):
         self.assertIn('"--allow-incomplete-assets"', HYDRATE_SCRIPT)
         self.assertIn('"--study-identifier"', HYDRATE_SCRIPT)
+        self.assertIn('"--study-inventory"', HYDRATE_SCRIPT)
+        self.assertIn('"--write-study-inventory"', HYDRATE_SCRIPT)
+        self.assertIn('"--derived-tables-sql"', HYDRATE_SCRIPT)
+        self.assertIn('"--timeline-generator-sha"', HYDRATE_SCRIPT)
         self.assertIn(
             "require_complete_assets=not args.allow_incomplete_assets",
             HYDRATE_SCRIPT,
         )
         self.assertIn('VERIFY_ALL_ACCESS:-1', E2E_SCRIPT)
+
+    def test_production_inventory_is_derived_from_canonical_patient_sample_overlap(self):
+        args = Namespace(
+            canonical_table="prod.canonical.associations",
+            registry_table="prod.registry.slides",
+            warehouse_id="warehouse",
+        )
+        targets = (
+            {"P-1": [(10, 100)], "P-2": [(20, 200)]},
+            {"S-1": [(10, 101, 100, "P-1")]},
+            {},
+        )
+        records = [
+            {"patient_id": "P-1", "sample_id": "S-1"},
+            {"patient_id": "P-2", "sample_id": ""},
+        ]
+        with mock.patch.object(HYDRATE, "_load_target_maps", return_value=targets), mock.patch.object(
+            HYDRATE.exporter, "_run_export_query", return_value=iter(records)
+        ):
+            inventory = HYDRATE._inventory_from_source(args, {10: "study_a", 20: "study_b"})
+
+        self.assertEqual(inventory["kind"], "canonical_impact_sample_membership")
+        self.assertEqual(
+            [study["study_id"] for study in inventory["studies"]], ["study_a", "study_b"]
+        )
+        self.assertEqual(inventory["studies"][0]["canonical_row_count"], 1)
+
+    def test_inventory_rejects_a_different_canonical_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "inventory.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "kind": "canonical_impact_sample_membership",
+                        "canonical_table": "dev.canonical.associations",
+                        "studies": [{"study_id": "study_a"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "does not match"):
+                HYDRATE._read_study_inventory(
+                    path,
+                    "prod.canonical.associations",
+                    "prod.registry.slides",
+                    "warehouse",
+                )
 
     def test_molecular_hydration_is_bulk_replace_and_covers_all_categories(self):
         self.assertIn("ALTER TABLE mutation DELETE", MOLECULAR_HYDRATE_SCRIPT)
@@ -570,6 +622,35 @@ class DatabricksExportContractTests(unittest.TestCase):
 
 
 class ReleaseManifestTests(unittest.TestCase):
+    def test_contains_manifest_allows_unrelated_catalog_studies_and_zero_wsi_entry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            study_dir = Path(temporary) / "study"
+            study_dir.mkdir()
+            (study_dir / "meta_study.txt").write_text(
+                "cancer_study_identifier: study_a\n", encoding="utf-8"
+            )
+            manifest = Path(temporary) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "catalog_policy": "contains",
+                        "inventory": {"kind": "canonical_impact_sample_membership"},
+                        "studies": [
+                            {
+                                "study_id": "study_a",
+                                "study_dir": str(study_dir),
+                                "require_wsi": False,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            policy, studies = STACK._read_manifest(manifest)
+            self.assertEqual(policy, "contains")
+            self.assertFalse(studies[0]["require_wsi"])
+
     def test_manifest_requires_pixel_snapshot_and_complete_timeline_pair(self):
         with tempfile.TemporaryDirectory() as temporary:
             study_dir = Path(temporary) / "study"
@@ -599,7 +680,9 @@ class ReleaseManifestTests(unittest.TestCase):
             with self.assertRaisesRegex(STACK.VerificationError, "missing the pathology timeline"):
                 STACK._read_manifest(manifest)
             _write_timeline_pair(study_dir)
-            self.assertEqual(STACK._read_manifest(manifest)[0]["study_id"], "study_a")
+            policy, studies = STACK._read_manifest(manifest)
+            self.assertEqual(policy, "exact")
+            self.assertEqual(studies[0]["study_id"], "study_a")
 
             timeline_dir = Path(temporary) / "timeline"
             timeline_dir.mkdir()

@@ -1,10 +1,16 @@
 {
   "version": 1,
+  "catalog_policy": "contains",
+  "inventory": {
+    "kind": "canonical_impact_sample_membership",
+    "canonical_table": "cdsi_prod.pathology_data_mining.canonical_slide_associations"
+  },
   "studies": [
     {
       "study_id": "study_id_from_meta_study",
       "study_dir": "/stable/release/path/study_id_from_meta_study",
       "timeline_dir": "/stable/release/path/study_id_from_meta_study",
+      "require_wsi": true,
       "require_molecular_data": true
     }
   ]

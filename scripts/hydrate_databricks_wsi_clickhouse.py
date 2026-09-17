@@ -16,6 +16,7 @@ left untouched.  No PHI table is queried.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -25,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -69,7 +71,20 @@ def _args() -> argparse.Namespace:
     p.add_argument("--database", required=True)
     p.add_argument(
         "--study-identifier",
-        help="hydrate only this cBioPortal study (recommended for a targeted repair)",
+        help="hydrate only this cBioPortal study (recommended for a targeted dev repair)",
+    )
+    p.add_argument(
+        "--study-inventory",
+        type=Path,
+        help=(
+            "JSON inventory generated from canonical IMPACT sample membership; "
+            "required for a production-wide hydration"
+        ),
+    )
+    p.add_argument(
+        "--write-study-inventory",
+        type=Path,
+        help="write the read-only canonical IMPACT study inventory and exit",
     )
     p.add_argument(
         "--import-role",
@@ -85,6 +100,23 @@ def _args() -> argparse.Namespace:
                    help="keep the temporary SQLite staging database for diagnosis")
     p.add_argument("--staging-db", type=Path,
                    help="reuse a completed SQLite staging database (skips Databricks scan)")
+    p.add_argument(
+        "--derived-tables-sql",
+        type=Path,
+        default=os.environ.get("CBIOPORTAL_DERIVED_TABLES_SQL", ""),
+        help=(
+            "release-pinned populate_derived_tables.sql; required for hydration "
+            "so the rebuild cannot silently use another checkout"
+        ),
+    )
+    p.add_argument(
+        "--timeline-generator-sha",
+        default=os.environ.get("WSI_TIMELINE_GENERATOR_SHA", ""),
+        help=(
+            "expected git SHA for WSI_TILE_SERVER_ROOT; required with "
+            "--study-inventory"
+        ),
+    )
     p.add_argument(
         "--allow-incomplete-assets",
         action="store_true",
@@ -341,6 +373,138 @@ def _candidate_targets(record: dict[str, Any], patient_targets, sample_targets):
         if key not in seen:
             seen.add(key)
             yield item
+
+
+def _inventory_from_source(
+    args: argparse.Namespace,
+    study_stable_by_id: dict[int, str],
+) -> dict[str, Any]:
+    """Build a frozen study inventory from the canonical IMPACT source.
+
+    This mode only reads the target portal's patient/sample maps and the
+    Databricks canonical association contract. It never creates or deletes
+    ClickHouse rows, which makes it safe to run before a production
+    maintenance window.
+    """
+    patient_targets, sample_targets, _ = _load_target_maps(args)
+    by_study: dict[int, dict[str, Any]] = {}
+    for record in exporter._run_export_query(
+        args.canonical_table, args.registry_table, args.warehouse_id
+    ):
+        for study_id, _sample_internal, _patient_internal, patient_stable in _candidate_targets(
+            record, patient_targets, sample_targets
+        ):
+            entry = by_study.setdefault(
+                study_id,
+                {
+                    "study_id": study_stable_by_id[study_id],
+                    "canonical_row_count": 0,
+                    "patient_ids": set(),
+                    "sample_ids": set(),
+                },
+            )
+            entry["canonical_row_count"] += 1
+            entry["patient_ids"].add(patient_stable)
+            sample_id = exporter._text(record.get("sample_id"))
+            if sample_id:
+                entry["sample_ids"].add(sample_id)
+
+    studies = []
+    for entry in sorted(by_study.values(), key=lambda value: value["study_id"]):
+        studies.append(
+            {
+                "study_id": entry["study_id"],
+                "canonical_row_count": entry["canonical_row_count"],
+                "patient_count": len(entry["patient_ids"]),
+                "sample_count": len(entry["sample_ids"]),
+            }
+        )
+    if not studies:
+        raise RuntimeError(
+            "canonical IMPACT source did not overlap any target portal study; "
+            "refusing to write an empty production inventory"
+        )
+    return {
+        "version": 1,
+        "kind": "canonical_impact_sample_membership",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "canonical_table": args.canonical_table,
+        "registry_table": args.registry_table,
+        "warehouse_id": args.warehouse_id,
+        "studies": studies,
+    }
+
+
+def _read_study_inventory(
+    path: Path, canonical_table: str, registry_table: str, warehouse_id: str
+) -> list[str]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot read study inventory: {path}") from exc
+    if not isinstance(value, dict) or value.get("version") != 1:
+        raise RuntimeError("study inventory must have version 1")
+    if value.get("kind") != "canonical_impact_sample_membership":
+        raise RuntimeError("study inventory is not a canonical IMPACT inventory")
+    for key, expected in (
+        ("canonical_table", canonical_table),
+        ("registry_table", registry_table),
+        ("warehouse_id", warehouse_id),
+    ):
+        declared = value.get(key)
+        if declared and declared != expected:
+            raise RuntimeError(
+                f"study inventory {key} does not match the hydration source: "
+                f"{declared} != {expected}"
+            )
+    studies = value.get("studies")
+    if not isinstance(studies, list) or not studies:
+        raise RuntimeError("study inventory must contain a non-empty studies array")
+    identifiers: list[str] = []
+    for item in studies:
+        if not isinstance(item, dict) or not isinstance(item.get("study_id"), str):
+            raise RuntimeError("study inventory contains an invalid study entry")
+        study_id = item["study_id"].strip()
+        if not study_id or study_id in identifiers:
+            raise RuntimeError(f"study inventory contains duplicate or empty study: {study_id}")
+        identifiers.append(study_id)
+    return identifiers
+
+
+def _validate_timeline_generator(expected_sha: str) -> str:
+    if not expected_sha:
+        raise RuntimeError(
+            "--timeline-generator-sha or WSI_TIMELINE_GENERATOR_SHA is required "
+            "for production hydration"
+        )
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_sha):
+        raise RuntimeError("timeline generator SHA must be a full lowercase git SHA")
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(_TILE_SERVER_ROOT), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(
+            f"cannot resolve timeline generator checkout: {_TILE_SERVER_ROOT}"
+        ) from exc
+    actual_sha = completed.stdout.strip()
+    if actual_sha != expected_sha:
+        raise RuntimeError(
+            "timeline generator checkout does not match the release pin: "
+            f"{actual_sha} != {expected_sha}"
+        )
+    return actual_sha
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _rank(values: list[str]) -> str:
@@ -615,14 +779,46 @@ def _insert_timeline(args: argparse.Namespace, db: sqlite3.Connection, study_sta
 
 def main() -> int:
     args = _args()
+    if args.study_identifier and (args.study_inventory or args.write_study_inventory):
+        raise RuntimeError("--study-identifier cannot be combined with inventory mode")
+    if args.study_inventory and args.write_study_inventory:
+        raise RuntimeError("--study-inventory and --write-study-inventory are mutually exclusive")
     if not args.clickhouse_config.is_file() or (args.clickhouse_config.stat().st_mode & 0o077):
         raise RuntimeError("ClickHouse config must exist and be mode 0600")
     if shutil.which(args.clickhouse_bin) is None and not Path(args.clickhouse_bin).is_file():
         raise RuntimeError(f"ClickHouse client not found: {args.clickhouse_bin}")
-    _check_import_permissions(args)
     prefixes = exporter._source_prefixes(args.allowed_source_prefixes)
     study_rows = _query_rows(args, "SELECT cancer_study_id, cancer_study_identifier FROM cancer_study FORMAT TSV")
     study_stable_by_id = {int(row[0]): row[1] for row in study_rows if row[1]}
+    if args.write_study_inventory:
+        inventory = _inventory_from_source(args, study_stable_by_id)
+        args.write_study_inventory.parent.mkdir(parents=True, exist_ok=True)
+        args.write_study_inventory.write_text(
+            json.dumps(inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        print(json.dumps(inventory, sort_keys=True), flush=True)
+        return 0
+
+    if args.study_inventory and not args.timeline_generator_sha:
+        raise RuntimeError(
+            "--timeline-generator-sha or WSI_TIMELINE_GENERATOR_SHA is required "
+            "for production hydration"
+        )
+
+    if not args.derived_tables_sql:
+        raise RuntimeError(
+            "--derived-tables-sql or CBIOPORTAL_DERIVED_TABLES_SQL is required for hydration"
+        )
+    args.derived_tables_sql = Path(args.derived_tables_sql).resolve()
+    if not args.derived_tables_sql.is_file():
+        raise RuntimeError(f"derived-table SQL does not exist: {args.derived_tables_sql}")
+    timeline_generator_sha = (
+        _validate_timeline_generator(args.timeline_generator_sha)
+        if args.study_inventory or args.timeline_generator_sha
+        else ""
+    )
+    _check_import_permissions(args)
+
     if args.study_identifier:
         selected_study_ids = {
             study_id
@@ -633,8 +829,29 @@ def main() -> int:
             raise RuntimeError(
                 f"requested study does not exist in ClickHouse: {args.study_identifier}"
             )
+    elif args.study_inventory:
+        inventory_ids = _read_study_inventory(
+            args.study_inventory,
+            args.canonical_table,
+            args.registry_table,
+            args.warehouse_id,
+        )
+        selected_study_ids = {
+            study_id
+            for study_id, identifier in study_stable_by_id.items()
+            if identifier in inventory_ids
+        }
+        missing = sorted(set(inventory_ids) - set(study_stable_by_id.values()))
+        if missing:
+            raise RuntimeError(
+                "study inventory contains studies missing from the target portal: "
+                + ",".join(missing)
+            )
     else:
-        selected_study_ids = None
+        raise RuntimeError(
+            "production hydration requires --study-inventory; use --study-identifier "
+            "for a targeted dev repair"
+        )
     patient_targets, sample_targets, patient_stable_by_internal = _load_target_maps(
         args, selected_study_ids
     )
@@ -677,6 +894,20 @@ def main() -> int:
                 flush=True,
             )
         study_ids = [row[0] for row in db.execute("SELECT DISTINCT study_id FROM slides ORDER BY study_id")]
+        expected_study_ids = set(selected_study_ids)
+        staged_study_ids = set(study_ids)
+        if staged_study_ids != expected_study_ids:
+            missing = sorted(expected_study_ids - staged_study_ids)
+            unexpected = sorted(staged_study_ids - expected_study_ids)
+            details = []
+            if missing:
+                details.append("missing=" + ",".join(map(str, missing)))
+            if unexpected:
+                details.append("unexpected=" + ",".join(map(str, unexpected)))
+            raise RuntimeError(
+                "staging database study scope does not match the selected release inventory: "
+                + " ".join(details)
+            )
         print(json.dumps({"stage": stats, "study_ids": study_ids, "allowed_source_prefixes": prefixes}, sort_keys=True), flush=True)
         _cleanup(args, study_ids)
         _populate_tables(args, db, study_ids)
@@ -689,19 +920,32 @@ def main() -> int:
         # this process is not necessarily visible inside the ClickHouse client
         # container.  ``--query`` also keeps this invocation compatible with
         # the migration client wrapper used by beta and release jobs.
-        populate = (Path(__file__).resolve().parents[2]
-                    / "cbioportal-prod-migration-rehearsal/src/main/resources/db-scripts/clickhouse/populate_derived_tables.sql")
         try:
-            populate_sql = populate.read_text(encoding="utf-8")
+            populate_sql = args.derived_tables_sql.read_text(encoding="utf-8")
         except OSError as exc:
-            raise RuntimeError(f"cannot read derived-table rebuild SQL: {populate}") from exc
+            raise RuntimeError(
+                f"cannot read derived-table rebuild SQL: {args.derived_tables_sql}"
+            ) from exc
         command = [args.clickhouse_bin, "client", "--config-file", str(args.clickhouse_config),
                    "--database", args.database, "--mutations_sync", "2", "--multiquery",
                    "--query", populate_sql, "--param_optimize_backoff_secs", "0"]
         result = subprocess.run(command, capture_output=True, text=True, check=False)
         if result.returncode:
             raise RuntimeError(f"derived-table rebuild failed: {result.stderr[-4000:]}")
-        print(json.dumps({"hydrated": True, "selected_rows": stats["selected_rows"], "study_count": len(study_ids), "timeline_event_count": timeline_count}, sort_keys=True), flush=True)
+        print(
+            json.dumps(
+                {
+                    "hydrated": True,
+                    "selected_rows": stats["selected_rows"],
+                    "study_count": len(study_ids),
+                    "timeline_event_count": timeline_count,
+                    "derived_tables_sql_sha256": _sha256(args.derived_tables_sql),
+                    "timeline_generator_sha": timeline_generator_sha,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
     finally:
         db_path_exists = staging_path.exists()
         try:

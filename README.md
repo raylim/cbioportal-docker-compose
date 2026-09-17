@@ -69,7 +69,7 @@ upload thumbnails. The Compose overlay supplies the shared WSI capability
 secret to the portal and tile server, but it does not replace the upstream
 artifact batch.
 
-The ClickHouse hydration command performs a read-only `CHECK GRANT` preflight
+The ClickHouse hydration command performs a read-only `SHOW GRANTS` preflight
 before it scans Databricks or deletes any existing rows. The import role must
 have SELECT on the cohort tables, INSERT and `ALTER DELETE` on the WSI and
 pathology-event tables, and TRUNCATE/OPTIMIZE plus INSERT on the derived-table
@@ -88,8 +88,11 @@ admitted study are complete and that real browser pixel requests work.
 
 Create a host-local manifest from the exact snapshot directories used by the
 import. Start with [`stack-release-manifest.example.json`](stack-release-manifest.example.json).
-Each entry must describe one and only one study in the running portal. Its
-snapshot must contain `meta_wsi.txt`, `data_wsi.txt`,
+For dev, use `catalog_policy: exact` and list the deliberately selected
+representative studies. For beta, use `catalog_policy: contains`, include
+`canonical_impact_sample_membership` inventory metadata, and list every study
+in the frozen production IMPACT inventory. Each listed study's snapshot must
+contain `meta_wsi.txt`, `data_wsi.txt`,
 `wsi_snapshot_manifest.json`, and a valid `data_filename` for every other
 `meta_*.txt` declaration. A WSI release must include the generated pathology
 timeline metadata/data pair; a snapshot that contains slides but no timeline
@@ -113,10 +116,12 @@ EXPECTED_WSI_TILE_SERVER_URL=http://localhost:8081 \
 scripts/verify-stack-release.sh
 ```
 
-The gate requires an exact catalog/manifest match, checks every patient
-hierarchy and every slide association, compares WSI clinical counts with
-ClickHouse, and exercises every servable access bundle (including its
-thumbnail). It samples three real servable slides per study (early, middle,
+The gate applies the manifest's catalog policy: dev can require an exact
+catalog match, while beta requires every eligible inventory study to exist and
+allows unrelated portal studies. It checks every patient hierarchy and every
+slide association, compares WSI clinical counts with ClickHouse, and exercises
+every servable access bundle (including its thumbnail). It samples three real
+servable slides per study (early, middle,
 late; preferring distinct patients) for pixel tile requests; set
 `VERIFY_ALL_TILES=1` for a pixel request for every servable slide. The portal's
 live `config_service` tile URL is authoritative; the expected URL is only an
@@ -201,6 +206,37 @@ python3 scripts/verify-study-load.py \
 The release manifest defaults `require_molecular_data` to `true`; set it to
 `false` only for a deliberately clinical/WSI-only study. This prevents a
 partial molecular snapshot from being silently treated as a complete release.
+
+For production hydration, first create the frozen eligible-study inventory
+without mutating ClickHouse. This resolves canonical IMPACT associations
+against the target portal's patient/sample ownership:
+
+```bash
+python3 scripts/hydrate_databricks_wsi_clickhouse.py \
+  --clickhouse-config /secure/beta-clickhouse-client.yml \
+  --database cbioportal \
+  --canonical-table cdsi_prod.pathology_data_mining.canonical_slide_associations \
+  --registry-table cdsi_prod.pathology_data_mining.slide_thumbnail_registry \
+  --write-study-inventory /secure/releases/beta-impact-study-inventory.json
+```
+
+Use that inventory for the production hydration. A targeted `--study-identifier`
+run remains available for representative dev studies; omitting both selectors
+is rejected so a production command cannot accidentally hydrate an implicit,
+unreviewed study set. Pass the release-pinned derived-table SQL explicitly:
+
+```bash
+python3 scripts/hydrate_databricks_wsi_clickhouse.py \
+  --clickhouse-config /secure/beta-clickhouse-client.yml \
+  --database cbioportal \
+  --study-inventory /secure/releases/beta-impact-study-inventory.json \
+  --derived-tables-sql /secure/releases/cbioportal/populate_derived_tables.sql \
+  --timeline-generator-sha e876b5fad065cf36622af596eee2b0d8356d3c1c
+```
+
+Set `require_wsi: false` for an eligible study only when the source inventory
+and acceptance evidence establish a legitimate zero-pathology result; that
+study still requires its expected molecular/clinical checks.
 
 For an authenticated deployment, provide a short-lived portal session cookie
 with `--cookie` (or `VERIFY_COOKIE`) for the hierarchy and access checks. The

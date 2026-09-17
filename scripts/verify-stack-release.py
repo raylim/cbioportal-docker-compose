@@ -7,10 +7,11 @@ set must match an explicit release manifest, and every listed study must have
 its own source snapshot, WSI hierarchy, clinical WSI counts, and real pixel
 smoke checks.
 
-The manifest is host-local and must not contain credentials. A minimal example
-is::
+The manifest is host-local and must not contain credentials. ``catalog_policy``
+is ``exact`` for a small dev stack and ``contains`` for beta, where the portal
+also contains unrelated studies. A minimal example is::
 
-    {"version": 1, "studies": [
+    {"version": 1, "catalog_policy": "contains", "studies": [
       {"study_id": "study_a", "study_dir": "/releases/study_a"}
     ]}
 
@@ -57,7 +58,7 @@ def _request_json(url: str, cookie: str) -> Any:
         raise VerificationError(f"portal catalog request failed: {type(error).__name__}") from None
 
 
-def _read_manifest(path: Path) -> list[dict[str, Any]]:
+def _read_manifest(path: Path) -> tuple[str, list[dict[str, Any]]]:
     if not path.is_file():
         raise VerificationError(f"stack release manifest does not exist: {path}")
     try:
@@ -66,6 +67,17 @@ def _read_manifest(path: Path) -> list[dict[str, Any]]:
         raise VerificationError("stack release manifest is not valid JSON") from None
     if not isinstance(value, dict) or value.get("version") != 1:
         raise VerificationError("stack release manifest must have version 1")
+    catalog_policy = value.get("catalog_policy", "exact")
+    if catalog_policy not in {"exact", "contains"}:
+        raise VerificationError("catalog_policy must be exact or contains")
+    if catalog_policy == "contains":
+        inventory = value.get("inventory")
+        if not isinstance(inventory, dict) or inventory.get(
+            "kind"
+        ) != "canonical_impact_sample_membership":
+            raise VerificationError(
+                "contains manifests require canonical IMPACT inventory metadata"
+            )
     studies = value.get("studies")
     if not isinstance(studies, list) or not studies:
         raise VerificationError("stack release manifest must contain a non-empty studies array")
@@ -85,62 +97,66 @@ def _read_manifest(path: Path) -> list[dict[str, Any]]:
         directory = Path(study_dir).expanduser().resolve()
         if not directory.is_dir():
             raise VerificationError(f"study directory does not exist for {study_id}: {directory}")
-        if not (directory / "meta_wsi.txt").is_file():
+        require_wsi = item.get("require_wsi", True)
+        if not isinstance(require_wsi, bool):
+            raise VerificationError(f"manifest study {study_id} require_wsi must be boolean")
+        if require_wsi and not (directory / "meta_wsi.txt").is_file():
             raise VerificationError(f"study {study_id} is missing meta_wsi.txt")
-        if not (directory / "wsi_snapshot_manifest.json").is_file():
+        if require_wsi and not (directory / "wsi_snapshot_manifest.json").is_file():
             raise VerificationError(f"study {study_id} is missing wsi_snapshot_manifest.json")
         wsi_values: dict[str, str] = {}
-        for line in (directory / "meta_wsi.txt").read_text(encoding="utf-8").splitlines():
-            if line.strip() and not line.startswith("#") and ":" in line:
-                key, value = line.split(":", 1)
-                wsi_values[key.strip()] = value.strip()
-        if wsi_values.get("cancer_study_identifier") != study_id:
-            raise VerificationError(
-                f"study {study_id} meta_wsi.txt has a different cancer_study_identifier"
-            )
-        try:
-            wsi_manifest = json.loads(
-                (directory / "wsi_snapshot_manifest.json").read_text(encoding="utf-8")
-            )
-        except json.JSONDecodeError:
-            raise VerificationError(f"study {study_id} has an invalid WSI snapshot manifest") from None
-        if not isinstance(wsi_manifest, dict):
-            raise VerificationError(f"study {study_id} WSI snapshot manifest is not an object")
-        if wsi_manifest.get("study_id") not in (None, study_id):
-            raise VerificationError(f"study {study_id} WSI snapshot manifest has a different study_id")
-        for key in ("association_row_count", "servable_row_count", "patient_count"):
+        if require_wsi:
+            for line in (directory / "meta_wsi.txt").read_text(encoding="utf-8").splitlines():
+                if line.strip() and not line.startswith("#") and ":" in line:
+                    key, value = line.split(":", 1)
+                    wsi_values[key.strip()] = value.strip()
+            if wsi_values.get("cancer_study_identifier") != study_id:
+                raise VerificationError(
+                    f"study {study_id} meta_wsi.txt has a different cancer_study_identifier"
+                )
             try:
-                count = int(wsi_manifest[key])
+                wsi_manifest = json.loads(
+                    (directory / "wsi_snapshot_manifest.json").read_text(encoding="utf-8")
+                )
+            except json.JSONDecodeError:
+                raise VerificationError(f"study {study_id} has an invalid WSI snapshot manifest") from None
+            if not isinstance(wsi_manifest, dict):
+                raise VerificationError(f"study {study_id} WSI snapshot manifest is not an object")
+            if wsi_manifest.get("study_id") not in (None, study_id):
+                raise VerificationError(f"study {study_id} WSI snapshot manifest has a different study_id")
+            for key in ("association_row_count", "servable_row_count", "patient_count"):
+                try:
+                    count = int(wsi_manifest[key])
+                except (KeyError, TypeError, ValueError):
+                    raise VerificationError(
+                        f"study {study_id} WSI snapshot manifest is missing integer {key}"
+                    ) from None
+                if count <= 0:
+                    raise VerificationError(
+                        f"study {study_id} WSI snapshot manifest has invalid {key}"
+                    )
+            try:
+                incomplete_assets = int(wsi_manifest["incomplete_asset_count"])
             except (KeyError, TypeError, ValueError):
                 raise VerificationError(
-                    f"study {study_id} WSI snapshot manifest is missing integer {key}"
+                    f"study {study_id} WSI snapshot manifest is missing integer "
+                    "incomplete_asset_count"
                 ) from None
-            if count <= 0:
+            if incomplete_assets != 0:
                 raise VerificationError(
-                    f"study {study_id} WSI snapshot manifest has invalid {key}"
+                    f"study {study_id} has {incomplete_assets} incomplete WSI assets"
                 )
-        try:
-            incomplete_assets = int(wsi_manifest["incomplete_asset_count"])
-        except (KeyError, TypeError, ValueError):
-            raise VerificationError(
-                f"study {study_id} WSI snapshot manifest is missing integer "
-                "incomplete_asset_count"
-            ) from None
-        if incomplete_assets != 0:
-            raise VerificationError(
-                f"study {study_id} has {incomplete_assets} incomplete WSI assets"
-            )
-        try:
-            filtered_rows = int(wsi_manifest["filtered_row_count"])
-        except (KeyError, TypeError, ValueError):
-            raise VerificationError(
-                f"study {study_id} WSI snapshot manifest is missing integer "
-                "filtered_row_count"
-            ) from None
-        if filtered_rows != 0:
-            raise VerificationError(
-                f"study {study_id} filtered {filtered_rows} WSI association rows"
-            )
+            try:
+                filtered_rows = int(wsi_manifest["filtered_row_count"])
+            except (KeyError, TypeError, ValueError):
+                raise VerificationError(
+                    f"study {study_id} WSI snapshot manifest is missing integer "
+                    "filtered_row_count"
+                ) from None
+            if filtered_rows != 0:
+                raise VerificationError(
+                    f"study {study_id} filtered {filtered_rows} WSI association rows"
+                )
         declared_files = _validate_declared_sources(directory, study_id)
         require_molecular_data = item.get("require_molecular_data", True)
         if not isinstance(require_molecular_data, bool):
@@ -155,11 +171,11 @@ def _read_manifest(path: Path) -> list[dict[str, Any]]:
             timeline_path / "meta_clinical_timeline_pathology_slides.txt",
             timeline_path / "data_clinical_timeline_pathology_slides.txt",
         ]
-        if not all(path.is_file() for path in timeline_files):
+        if require_wsi and not all(path.is_file() for path in timeline_files):
             if any(path.is_file() for path in timeline_files):
                 raise VerificationError(f"study {study_id} has an incomplete pathology timeline")
             raise VerificationError(f"study {study_id} is missing the pathology timeline")
-        if timeline_path != directory and all(path.is_file() for path in timeline_files):
+        if require_wsi and timeline_path != directory and all(path.is_file() for path in timeline_files):
             _validate_declared_sources(timeline_path, study_id)
         seen.add(study_id)
         normalized.append(
@@ -170,9 +186,10 @@ def _read_manifest(path: Path) -> list[dict[str, Any]]:
                 "timeline_dir": str(timeline_path),
                 "declared_files": declared_files,
                 "require_molecular_data": require_molecular_data,
+                "require_wsi": require_wsi,
             }
         )
-    return normalized
+    return catalog_policy, normalized
 
 
 def _validate_declared_sources(directory: Path, study_id: str) -> list[str]:
@@ -252,23 +269,26 @@ def _verify_study(
         "--clickhouse-database",
         args.clickhouse_database,
         "--check-study-view",
-        "--require-wsi",
-        "--check-all-wsi",
-        "--timeline-patient-sample",
-        str(args.timeline_patient_sample),
-        "--check-wsi-clinical-counts",
-        # A release gate must exercise every servable access bundle.  The
-        # bounded --check-access smoke is useful during development, but it
-        # cannot catch a patient-specific missing source or thumbnail.
-        "--check-all-access",
         "--wsi-sample-size",
         str(args.wsi_sample_size),
         "--expected-tile-url",
         args.expected_tile_url,
     ]
-    timeline_meta = Path(study["timeline_dir"]) / "meta_clinical_timeline_pathology_slides.txt"
-    if timeline_meta.is_file():
-        command.append("--check-timeline")
+    if study.get("require_wsi", True):
+        command.extend(
+            [
+                "--require-wsi",
+                "--check-all-wsi",
+                "--timeline-patient-sample",
+                str(args.timeline_patient_sample),
+                "--check-wsi-clinical-counts",
+                # A release gate must exercise every servable access bundle.
+                "--check-all-access",
+            ]
+        )
+        timeline_meta = Path(study["timeline_dir"]) / "meta_clinical_timeline_pathology_slides.txt"
+        if timeline_meta.is_file():
+            command.append("--check-timeline")
     if study.get("require_molecular_data", True):
         command.append("--check-all-data")
     if check_all_tiles:
@@ -371,7 +391,7 @@ def main() -> int:
         parser.error("--timeline-patient-sample must not be negative")
 
     try:
-        studies = _read_manifest(args.manifest)
+        catalog_policy, studies = _read_manifest(args.manifest)
         encoded = urllib.parse.urlencode(
             {"projection": "DETAILED", "pageSize": "10000000", "pageNumber": "0"}
         )
@@ -379,13 +399,18 @@ def main() -> int:
         expected = {str(study["study_id"]) for study in studies}
         missing = sorted(expected - catalog)
         unexpected = sorted(catalog - expected)
-        if missing or unexpected:
+        if catalog_policy == "exact" and (missing or unexpected):
             details = []
             if missing:
                 details.append("missing=" + ",".join(missing))
             if unexpected:
                 details.append("unexpected=" + ",".join(unexpected))
             raise VerificationError("portal study catalog does not match release manifest: " + " ".join(details))
+        if catalog_policy == "contains" and missing:
+            raise VerificationError(
+                "portal study catalog is missing eligible release studies: "
+                + ",".join(missing)
+            )
 
         results = [
             _verify_study(args, study, check_all_tiles=args.all_tiles)
@@ -396,6 +421,7 @@ def main() -> int:
                 {
                     "catalog_studies": len(catalog),
                     "release_studies": len(studies),
+                    "catalog_policy": catalog_policy,
                     "studies": results,
                     "status": "accepted",
                 },

@@ -28,13 +28,15 @@ Optional environment:
   VERIFY_COOKIE              short-lived portal session cookie
   CLICKHOUSE_PASSWORD        ClickHouse password; never echoed
 
-The manifest must use version 1 and contain one entry per study, with
-study_id and study_dir. Every entry must contain meta_wsi.txt, both pathology
-timeline files, and a valid wsi_snapshot_manifest.json with non-zero
-association, servable, and patient counts and incomplete_asset_count=0. The
-gate checks every servable access bundle (including thumbnails); studies
-without a complete WSI asset contract or required molecular contract are
-rejected.
+The manifest must use version 1 and contain one entry per eligible study, with
+study_id and study_dir. Use catalog_policy=exact for a dev stack whose catalog
+is intentionally limited; use catalog_policy=contains for beta and include
+canonical IMPACT inventory metadata. A WSI study must contain meta_wsi.txt,
+both pathology timeline files, and a valid wsi_snapshot_manifest.json with
+non-zero association, servable, and patient counts and
+incomplete_asset_count=0. Set require_wsi=false only for an eligible study
+with a verified zero-pathology result. The gate checks every servable access
+bundle (including thumbnails) and required molecular contract.
 USAGE
   exit 0
 fi
