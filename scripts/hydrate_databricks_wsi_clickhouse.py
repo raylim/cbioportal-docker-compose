@@ -174,7 +174,7 @@ def _check_import_permissions(args: argparse.Namespace) -> None:
     for privilege, table in checks:
         result = _query_rows(
             args,
-            f"CHECK GRANT {privilege} ON {args.database}.{table} FORMAT TSV",
+            f"CHECK GRANT {privilege} ON TABLE {args.database}.{table} FORMAT TSV",
         )
         if not result or not result[0] or result[0][0] != "1":
             missing.append((privilege, table))
