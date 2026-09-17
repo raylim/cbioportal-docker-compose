@@ -82,10 +82,10 @@ class PortalTileContractTests(unittest.TestCase):
         args = Namespace(database="cbioportal_msk_beta", import_role="beta_wsi_import_role")
         with mock.patch.object(
             HYDRATE,
-            "_query_rows",
-            side_effect=lambda _args, query: [["0"]]
-            if "clinical_event" in query
-            else [["1"]],
+            "_run_client",
+            return_value=(
+                "GRANT SELECT ON cbioportal_msk_beta.* TO beta_wsi_import_role\n"
+            ),
         ):
             with self.assertRaisesRegex(RuntimeError, "complete WSI hydration"):
                 HYDRATE._check_import_permissions(args)

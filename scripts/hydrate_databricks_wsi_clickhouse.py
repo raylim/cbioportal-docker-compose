@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -120,8 +121,10 @@ def _check_import_permissions(args: argparse.Namespace) -> None:
     """Fail before staging cleanup if the importer cannot complete a release.
 
     The previous flow discovered missing RBAC only after deleting part of a
-    study.  ``CHECK GRANT`` is read-only and lets the caller fix the role before
-    any Databricks scan or ClickHouse mutation begins.
+    study.  ``SHOW GRANTS`` is read-only and lets the caller fix the role before
+    any Databricks scan or ClickHouse mutation begins.  We inspect the role's
+    grant text instead of issuing ``CHECK GRANT`` because older ClickHouse
+    clients parse that statement as the unrelated table-check command.
     """
     readable = ("cancer_study", "patient", "sample")
     wsi_tables = (
@@ -170,13 +173,46 @@ def _check_import_permissions(args: argparse.Namespace) -> None:
             *derived_tables,
         )
     )
+    if re.fullmatch(r"[A-Za-z0-9_]+", args.import_role) is None:
+        raise RuntimeError("--import-role must contain only letters, digits, and underscores")
+    grant_lines = _run_client(
+        args, f"SHOW GRANTS FOR {args.import_role}", capture=True
+    ).splitlines()
+
+    def split_privileges(value: str) -> list[str]:
+        parts: list[str] = []
+        start = 0
+        depth = 0
+        for index, character in enumerate(value):
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth = max(0, depth - 1)
+            elif character == "," and depth == 0:
+                parts.append(value[start:index].strip())
+                start = index + 1
+        parts.append(value[start:].strip())
+        return [part for part in parts if part]
+
+    grants: list[tuple[set[str], str]] = []
+    for line in grant_lines:
+        match = re.fullmatch(r"GRANT (.+) ON ([^ ]+) TO .+", line.strip())
+        if not match:
+            continue
+        grants.append((set(split_privileges(match.group(1))), match.group(2)))
+
+    def covered(privilege: str, table: str) -> bool:
+        object_names = {f"{args.database}.{table}", f"{args.database}.*", "*.*"}
+        for granted, object_name in grants:
+            if object_name not in object_names:
+                continue
+            if privilege in granted or (privilege.startswith("ALTER ") and "ALTER" in granted):
+                return True
+        return False
+
     missing: list[tuple[str, str]] = []
     for privilege, table in checks:
-        result = _query_rows(
-            args,
-            f"CHECK GRANT {privilege} ON TABLE {args.database}.{table} FORMAT TSV",
-        )
-        if not result or not result[0] or result[0][0] != "1":
+        if not covered(privilege, table):
             missing.append((privilege, table))
     if missing:
         grants = "; ".join(
