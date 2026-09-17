@@ -71,6 +71,7 @@ class PortalTileContractTests(unittest.TestCase):
 
     def test_hydration_is_strict_by_default(self):
         self.assertIn('"--allow-incomplete-assets"', HYDRATE_SCRIPT)
+        self.assertIn('"--study-identifier"', HYDRATE_SCRIPT)
         self.assertIn(
             "require_complete_assets=not args.allow_incomplete_assets",
             HYDRATE_SCRIPT,

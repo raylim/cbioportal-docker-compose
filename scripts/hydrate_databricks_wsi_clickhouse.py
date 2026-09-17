@@ -58,6 +58,10 @@ def _args() -> argparse.Namespace:
     p.add_argument("--clickhouse-bin", default="clickhouse")
     p.add_argument("--database", required=True)
     p.add_argument(
+        "--study-identifier",
+        help="hydrate only this cBioPortal study (recommended for a targeted repair)",
+    )
+    p.add_argument(
         "--import-role",
         default=os.environ.get("CLICKHOUSE_IMPORT_ROLE", "beta_wsi_import_role"),
         help="role named in missing-permission remediation instructions",
@@ -237,7 +241,7 @@ def _insert_stream(args: argparse.Namespace, table: str, columns: list[str],
     return count
 
 
-def _load_target_maps(args: argparse.Namespace) -> tuple[dict[str, list[tuple[int, int]]],
+def _load_target_maps(args: argparse.Namespace, study_ids: set[int] | None = None) -> tuple[dict[str, list[tuple[int, int]]],
                                                           dict[str, list[tuple[int, int, int, str]]],
                                                           dict[int, str]]:
     patient_rows = _query_rows(args, "SELECT stable_id, internal_id, cancer_study_id FROM patient FORMAT TSV")
@@ -248,6 +252,8 @@ def _load_target_maps(args: argparse.Namespace) -> tuple[dict[str, list[tuple[in
         if not stable:
             continue
         internal_id, study_id = int(internal), int(study)
+        if study_ids is not None and study_id not in study_ids:
+            continue
         patient_stable_by_internal[internal_id] = stable
         patient_study_by_internal[internal_id] = study_id
         patient_targets[stable].append((study_id, internal_id))
@@ -565,9 +571,23 @@ def main() -> int:
         raise RuntimeError(f"ClickHouse client not found: {args.clickhouse_bin}")
     _check_import_permissions(args)
     prefixes = exporter._source_prefixes(args.allowed_source_prefixes)
-    patient_targets, sample_targets, patient_stable_by_internal = _load_target_maps(args)
     study_rows = _query_rows(args, "SELECT cancer_study_id, cancer_study_identifier FROM cancer_study FORMAT TSV")
     study_stable_by_id = {int(row[0]): row[1] for row in study_rows if row[1]}
+    if args.study_identifier:
+        selected_study_ids = {
+            study_id
+            for study_id, identifier in study_stable_by_id.items()
+            if identifier == args.study_identifier
+        }
+        if not selected_study_ids:
+            raise RuntimeError(
+                f"requested study does not exist in ClickHouse: {args.study_identifier}"
+            )
+    else:
+        selected_study_ids = None
+    patient_targets, sample_targets, patient_stable_by_internal = _load_target_maps(
+        args, selected_study_ids
+    )
     staging_path = args.staging_db.resolve() if args.staging_db else Path(tempfile.mkstemp(prefix="wsi_hydration_", suffix=".sqlite")[1])
     owns_staging = args.staging_db is None
     try:
