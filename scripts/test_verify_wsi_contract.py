@@ -389,6 +389,31 @@ class DatabricksExportContractTests(unittest.TestCase):
         self.assertEqual(stats["registry_failed"], 1)
         self.assertEqual(stats["incomplete"], 0)
 
+    def test_export_keeps_registry_success_with_invalid_metadata_non_servable(self):
+        record = {
+            "patient_id": "P-1",
+            "match_level": "UNMATCHED",
+            "image_id": "slide-invalid-metadata",
+            "can_serve_tiles": True,
+            "registry_status": "success",
+            "slide_path": "s3://mskmind-bkt/reef-slides/slide-invalid-metadata.svs",
+            "artifact_uri": "s3://mskmind-bkt/wsi-thumbnails/masters/slide-invalid-metadata.jpg",
+            "tile_metadata_json": "{}",
+        }
+        stats = {"canonical_servable": 0, "incomplete": 0, "registry_invalid": 0}
+        values = EXPORT._row(
+            record,
+            {"P-1"},
+            set(),
+            {},
+            require_complete_assets=True,
+            asset_stats=stats,
+        )
+        self.assertIsNotNone(values)
+        self.assertEqual(values[EXPORT.DATA_COLUMNS.index("CAN_SERVE_TILES")], "FALSE")
+        self.assertEqual(stats["registry_invalid"], 1)
+        self.assertEqual(stats["incomplete"], 0)
+
     def test_export_diagnostic_escape_hatch_keeps_the_association_non_servable(self):
         record = {
             "patient_id": "P-1",
