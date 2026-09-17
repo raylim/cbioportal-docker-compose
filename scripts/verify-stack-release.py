@@ -16,7 +16,10 @@ is::
 
 The referenced snapshot must contain a valid ``wsi_snapshot_manifest.json``
 with non-zero association, servable, and patient counts and
-``incomplete_asset_count=0``.
+``incomplete_asset_count=0``. Each study must explicitly declare whether
+molecular data is required with ``require_molecular_data``; it defaults to
+``true`` and may be set to ``false`` only for a deliberately clinical/WSI-only
+study.
 """
 
 from __future__ import annotations
@@ -139,6 +142,11 @@ def _read_manifest(path: Path) -> list[dict[str, Any]]:
                 f"study {study_id} filtered {filtered_rows} WSI association rows"
             )
         declared_files = _validate_declared_sources(directory, study_id)
+        require_molecular_data = item.get("require_molecular_data", True)
+        if not isinstance(require_molecular_data, bool):
+            raise VerificationError(
+                f"manifest study {study_id} require_molecular_data must be boolean"
+            )
         timeline_dir = item.get("timeline_dir", study_dir)
         if not isinstance(timeline_dir, str) or not timeline_dir.strip():
             raise VerificationError(f"manifest timeline_dir is invalid for {study_id}")
@@ -161,6 +169,7 @@ def _read_manifest(path: Path) -> list[dict[str, Any]]:
                 "study_dir": str(directory),
                 "timeline_dir": str(timeline_path),
                 "declared_files": declared_files,
+                "require_molecular_data": require_molecular_data,
             }
         )
     return normalized
@@ -208,21 +217,6 @@ def _catalog_ids(value: Any) -> set[str]:
     if not ids:
         raise VerificationError("portal study catalog is empty")
     return ids
-
-
-def _has_complete_molecular_snapshot(study_dir: Path) -> bool:
-    """Use the strict molecular verifier when the study declares those files."""
-    candidates = (
-        ("meta_mutations.txt", "meta_mutations_extended.txt"),
-        ("meta_cna.txt", "meta_CNA.txt"),
-        ("meta_sv.txt",),
-        ("meta_cna_hg19_seg.txt", "mskimpact_meta_cna_hg19_seg.txt"),
-        ("meta_gene_panel_matrix.txt", "meta_gene_matrix.txt"),
-    )
-    return all(any((study_dir / name).is_file() for name in names) for names in candidates) and all(
-        (study_dir / name).is_file()
-        for name in ("meta_clinical_patient.txt", "meta_clinical_sample.txt")
-    )
 
 
 def _env_int(name: str, default: int) -> int:
@@ -275,7 +269,7 @@ def _verify_study(
     timeline_meta = Path(study["timeline_dir"]) / "meta_clinical_timeline_pathology_slides.txt"
     if timeline_meta.is_file():
         command.append("--check-timeline")
-    if _has_complete_molecular_snapshot(Path(study_dir)):
+    if study.get("require_molecular_data", True):
         command.append("--check-all-data")
     if check_all_tiles:
         command.append("--check-all-tiles")

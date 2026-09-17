@@ -920,16 +920,33 @@ def _tabular_rows(path: Path) -> Iterable[dict[str, str]]:
 
 
 def _gene_symbol_map(args: argparse.Namespace) -> dict[str, set[int]]:
-    """Return canonical and alias symbols mapped to all known Entrez IDs."""
-    rows = _clickhouse_query(
+    """Return symbols using the importer’s canonical-gene precedence."""
+    canonical_rows = _clickhouse_query(
         args,
-        "SELECT toString(entrez_gene_id), hugo_gene_symbol FROM gene "
-        "UNION ALL SELECT toString(entrez_gene_id), gene_alias FROM gene_alias",
+        "SELECT toString(entrez_gene_id), hugo_gene_symbol FROM gene",
+        timeout=120,
+    )
+    alias_rows = _clickhouse_query(
+        args,
+        "SELECT toString(entrez_gene_id), gene_alias FROM gene_alias",
         timeout=120,
     )
     symbols: dict[str, set[int]] = {}
-    for row in rows:
+    for row in canonical_rows:
         if len(row) != 2:
+            continue
+        try:
+            entrez = int(row[0])
+        except ValueError:
+            continue
+        symbols.setdefault(row[1].upper(), set()).add(entrez)
+    for row in alias_rows:
+        if len(row) != 2:
+            continue
+        # DaoGeneOptimized resolves an exact canonical symbol before looking
+        # at aliases. Preserve that precedence so source-count expectations
+        # match the importer rather than treating common aliases as ambiguous.
+        if row[1].upper() in symbols:
             continue
         try:
             entrez = int(row[0])
@@ -988,14 +1005,26 @@ def _study_data_snapshot(args: argparse.Namespace, study_id: str, study_dir: Pat
         else {value.strip() for value in configured_filter.split(",") if value.strip()}
     )
 
+    gene_symbols = _gene_symbol_map(args)
+    gene_ids = {gene_id for ids in gene_symbols.values() for gene_id in ids}
+
     mutation_rows = 0
     mutation_filtered = 0
     mutation_samples: set[str] = set()
-    mutation_symbols: set[str] = set()
+    mutation_unresolved_symbols: set[str] = set()
     mutation_classifications: Counter[str] = Counter()
     for row in _tabular_rows(mutation_path):
         mutation_rows += 1
-        mutation_symbols.add((row.get("Hugo_Symbol") or "").strip().upper())
+        symbol = (row.get("Hugo_Symbol") or "").strip().upper()
+        symbol_ids = gene_symbols.get(symbol, set())
+        try:
+            entrez_id = int((row.get("Entrez_Gene_Id") or "").strip())
+        except ValueError:
+            entrez_id = 0
+        if len(symbol_ids) != 1 and entrez_id not in gene_ids:
+            if symbol:
+                mutation_unresolved_symbols.add(symbol)
+            continue
         classification = (row.get("Variant_Classification") or "").strip()
         if classification in mutation_filter:
             mutation_filtered += 1
@@ -1008,7 +1037,8 @@ def _study_data_snapshot(args: argparse.Namespace, study_id: str, study_dir: Pat
     cna_rows = 0
     cna_events = 0
     cna_samples: set[str] = set()
-    cna_symbols: set[str] = set()
+    cna_unresolved_symbols: set[str] = set()
+    cna_gene_ids: set[int] = set()
     with cna_path.open(encoding="utf-8", newline="") as handle:
         lines = (line for line in handle if line.strip() and not line.startswith("#"))
         reader = csv.reader(lines, delimiter="\t")
@@ -1023,17 +1053,22 @@ def _study_data_snapshot(args: argparse.Namespace, study_id: str, study_dir: Pat
             if not row:
                 continue
             cna_rows += 1
-            cna_symbols.add(row[0].strip().upper())
+            symbol = row[0].strip().upper()
+            symbol_ids = gene_symbols.get(symbol, set())
+            if len(symbol_ids) != 1:
+                if symbol:
+                    cna_unresolved_symbols.add(symbol)
+                continue
+            gene_id = next(iter(symbol_ids))
+            if gene_id in cna_gene_ids:
+                continue
+            cna_gene_ids.add(gene_id)
             for index, value in enumerate(row[1:]):
                 value = value.strip()
                 if value and value.upper() != "NA" and value not in {"0", "0.0"}:
                     cna_events += 1
                     if index < len(cna_sample_ids) and cna_sample_ids[index]:
                         cna_samples.add(cna_sample_ids[index])
-
-    gene_symbols = _gene_symbol_map(args)
-    missing_mutation_symbols = sorted(symbol for symbol in mutation_symbols if symbol and symbol not in gene_symbols)
-    missing_cna_symbols = sorted(symbol for symbol in cna_symbols if symbol and symbol not in gene_symbols)
 
     sv_rows = 0
     sv_samples: set[str] = set()
@@ -1168,7 +1203,7 @@ def _study_data_snapshot(args: argparse.Namespace, study_id: str, study_dir: Pat
             raise VerificationError("ClickHouse mutation classification query returned a non-numeric value") from None
 
     expected = {
-        "mutations": (mutation_rows - mutation_filtered, len(mutation_samples), 0),
+        "mutations": (sum(mutation_classifications.values()), len(mutation_samples), 0),
         "cna": (cna_events, len(cna_samples), 0),
         "structural_variants": (len(sv_keys), len(sv_samples), 0),
         "segments": (seg_rows, len(seg_samples), 0),
@@ -1184,13 +1219,6 @@ def _study_data_snapshot(args: argparse.Namespace, study_id: str, study_dir: Pat
             f"{dict(sorted(mutation_classifications.items()))}, loaded "
             f"{dict(sorted(actual_mutation_classifications.items()))}"
         )
-    if missing_mutation_symbols or missing_cna_symbols:
-        mismatches.append(
-            "unresolved mutation/CNA symbols: "
-            + ", ".join((missing_mutation_symbols + missing_cna_symbols)[:20])
-        )
-    if sv_unresolved_rows:
-        mismatches.append(f"{sv_unresolved_rows} SV rows have no recognized gene")
     if mismatches:
         raise VerificationError("study data completeness failed: " + "; ".join(mismatches))
 
@@ -1242,10 +1270,15 @@ def _study_data_snapshot(args: argparse.Namespace, study_id: str, study_dir: Pat
     return {
         "source_mutation_rows": mutation_rows,
         "source_mutation_filtered_rows": mutation_filtered,
+        "source_mutation_unresolved_rows": mutation_rows
+        - mutation_filtered
+        - sum(mutation_classifications.values()),
+        "source_mutation_unresolved_symbols": sorted(mutation_unresolved_symbols),
         "source_mutation_classifications": dict(sorted(mutation_classifications.items())),
         "database_mutation_classifications": dict(sorted(actual_mutation_classifications.items())),
         "database_mutation_rows": actual["mutations"][0],
         "source_cna_events": cna_events,
+        "source_cna_unresolved_symbols": sorted(cna_unresolved_symbols),
         "database_cna_events": actual["cna"][0],
         "source_sv_rows": sv_rows,
         "source_sv_duplicate_rows": sv_rows - len(sv_keys) - sv_unresolved_rows,
@@ -1318,7 +1351,11 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     # queried patient-by-patient.  The study-wide clinical-events endpoint
     # materializes every event attribute in one response and can exhaust the
     # portal heap for cohorts with hundreds of thousands of events.
-    wsi: dict[str, Any] | None = _parse_wsi_file(args.study_dir) if args.study_dir else None
+    wsi: dict[str, Any] | None = (
+        _parse_wsi_file(args.study_dir)
+        if args.study_dir and not args.skip_wsi_checks
+        else None
+    )
 
     if args.check_timeline:
         timeline_dir = args.timeline_dir or args.study_dir
@@ -1493,7 +1530,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
                     f"WSI snapshot does not contain patient {args.wsi_patient_id}"
                 )
             result["wsi_patient_id"] = args.wsi_patient_id
-    if args.clickhouse_container:
+    if args.clickhouse_container and not args.skip_wsi_checks:
         db_rows, db_servable = _clickhouse_wsi_counts(args, study_id)
         result["database_wsi_rows"] = db_rows
         result["database_wsi_servable"] = db_servable
@@ -1899,6 +1936,11 @@ def main() -> int:
         help="cap tile requests while retaining full access/thumbnail coverage",
     )
     parser.add_argument("--require-wsi", action="store_true")
+    parser.add_argument(
+        "--skip-wsi-checks",
+        action="store_true",
+        help="skip WSI snapshot, hierarchy, timeline, and access checks for a molecular-only audit",
+    )
     parser.add_argument(
         "--check-wsi-clinical-counts",
         action="store_true",

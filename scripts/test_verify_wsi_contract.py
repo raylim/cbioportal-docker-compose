@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parent
 E2E_SCRIPT = (ROOT / "verify-databricks-wsi-e2e.sh").read_text()
 STACK_SCRIPT = (ROOT / "verify-stack-release.sh").read_text()
 HYDRATE_SCRIPT = (ROOT / "hydrate_databricks_wsi_clickhouse.py").read_text()
+MOLECULAR_HYDRATE_SCRIPT = (ROOT / "hydrate-study-molecular.sh").read_text()
 
 
 def _load(name: str, path: Path):
@@ -78,6 +79,14 @@ class PortalTileContractTests(unittest.TestCase):
         )
         self.assertIn('VERIFY_ALL_ACCESS:-1', E2E_SCRIPT)
 
+    def test_molecular_hydration_is_bulk_replace_and_covers_all_categories(self):
+        self.assertIn("ALTER TABLE mutation DELETE", MOLECULAR_HYDRATE_SCRIPT)
+        self.assertIn("ALTER TABLE sample_cna_event DELETE", MOLECULAR_HYDRATE_SCRIPT)
+        self.assertIn("ALTER TABLE structural_variant DELETE", MOLECULAR_HYDRATE_SCRIPT)
+        self.assertIn("ImportCopyNumberSegmentData", MOLECULAR_HYDRATE_SCRIPT)
+        self.assertIn("ImportGenePanelProfileMap", MOLECULAR_HYDRATE_SCRIPT)
+        self.assertNotIn("--overwrite-existing --meta", MOLECULAR_HYDRATE_SCRIPT)
+
     def test_hydration_checks_permissions_before_mutating(self):
         args = Namespace(database="cbioportal_msk_beta", import_role="beta_wsi_import_role")
         with mock.patch.object(
@@ -119,6 +128,30 @@ class PortalTileContractTests(unittest.TestCase):
             command = run.call_args.args[0]
             self.assertIn("--check-all-access", command)
             self.assertNotIn("--check-access", command)
+
+    def test_release_gate_requires_molecular_data_by_default(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            completed = mock.Mock(stdout=json.dumps({"status": "accepted"}))
+            args = Namespace(
+                portal_url="https://portal.example.test",
+                clickhouse_container="clickhouse",
+                clickhouse_user="cbio_user",
+                clickhouse_database="cbioportal",
+                timeline_patient_sample=0,
+                wsi_sample_size=1,
+                expected_tile_url="",
+                cookie="",
+                study_timeout_seconds=60,
+            )
+            study = {
+                "study_id": "study_a",
+                "study_dir": temporary,
+                "timeline_dir": temporary,
+                "declared_files": [],
+            }
+            with mock.patch.object(STACK.subprocess, "run", return_value=completed) as run:
+                STACK._verify_study(args, study, check_all_tiles=False)
+            self.assertIn("--check-all-data", run.call_args.args[0])
 
     def test_portal_config_is_authoritative_and_cross_origin_is_preflighted(self):
         args = Namespace(cookie="", expected_tile_url="https://tiles.example.test/")

@@ -4,7 +4,8 @@
     {
       "study_id": "study_id_from_meta_study",
       "study_dir": "/stable/release/path/study_id_from_meta_study",
-      "timeline_dir": "/stable/release/path/study_id_from_meta_study"
+      "timeline_dir": "/stable/release/path/study_id_from_meta_study",
+      "require_molecular_data": true
     }
   ]
 }

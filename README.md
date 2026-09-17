@@ -174,6 +174,24 @@ python3 scripts/verify-study-load.py \
   --check-study-view --check-all-data
 ```
 
+For an existing study snapshot, hydrate molecular data with the bulk-replace
+workflow before reopening the portal. It loads mutations, discrete CNA,
+structural variants, segments, and gene-panel mappings, rebuilds derived
+tables, and runs the molecular completeness check. Stop the portal for the
+database replacement and restart it before verification:
+
+```bash
+scripts/hydrate-study-molecular.sh \
+  --study-dir /path/to/study/mskimpact \
+  --study-id mskimpact \
+  --clickhouse-container cbioportal-database-container \
+  --importer-jar /path/to/core-IMPORTER.jar
+```
+
+The release manifest defaults `require_molecular_data` to `true`; set it to
+`false` only for a deliberately clinical/WSI-only study. This prevents a
+partial molecular snapshot from being silently treated as a complete release.
+
 For an authenticated deployment, provide a short-lived portal session cookie
 with `--cookie` (or `VERIFY_COOKIE`) for the hierarchy and access checks. The
 command exits non-zero on a missing catalog entry, empty WSI hierarchy, invalid
