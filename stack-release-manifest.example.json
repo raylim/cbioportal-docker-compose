@@ -3,7 +3,11 @@
   "catalog_policy": "contains",
   "inventory": {
     "kind": "canonical_impact_sample_membership",
-    "canonical_table": "cdsi_prod.pathology_data_mining.canonical_slide_associations"
+    "canonical_table": "cdsi_prod.pathology_data_mining.canonical_slide_associations",
+    "inventory_sha256": "replace-with-sha256-of-the-inventory-without-this-field",
+    "studies": [
+      {"study_id": "study_id_from_meta_study"}
+    ]
   },
   "studies": [
     {

@@ -69,8 +69,22 @@ DATA_COLUMNS = (
 TIMELINE_COLUMNS = (
     "timeline_start_days",
     "timeline_date_status",
+    "timeline_date_kind",
+    "timeline_date_source",
+    "timeline_date_reason",
+    "timeline_coordinate_system",
     "slide_timepoint_source",
 )
+WSI_FILE_TIMING_COLUMNS = (
+    "TIMELINE_START_DAYS",
+    "TIMELINE_DATE_STATUS",
+    "TIMELINE_DATE_KIND",
+    "TIMELINE_DATE_SOURCE",
+    "TIMELINE_DATE_REASON",
+    "TIMELINE_COORDINATE_SYSTEM",
+    "TIMEPOINT_SOURCE",
+)
+WSI_FILE_COLUMNS = DATA_COLUMNS + WSI_FILE_TIMING_COLUMNS
 
 _DESCRIPTIONS = {
     "PATIENT_ID": "cBioPortal patient stable identifier.",
@@ -107,14 +121,19 @@ _DESCRIPTIONS = {
 }
 
 _INTEGER_COLUMNS = {"FILE_SIZE_BYTES", "THUMBNAIL_WIDTH", "THUMBNAIL_HEIGHT"}
+_INTEGER_COLUMNS |= {"TIMELINE_START_DAYS"}
 _BOOLEAN_COLUMNS = {"IS_HNE", "IS_IHC", "CAN_SERVE_TILES"}
 _SOURCE_PREFIX_ENV = "WSI_ALLOWED_SOURCE_PREFIXES"
-# Keep a narrow default for callers that use the pure row helper without a
-# deployment environment.  Production/e2e invocations must provide the same
-# approved-prefix list used by the tile server through WSI_ALLOWED_SOURCE_PREFIXES
-# (or --allowed-source-prefix).  This prevents the exporter and pixel service
-# from disagreeing about which S3 locations are actually servable.
-_DEFAULT_SOURCE_PREFIXES = ("s3://mskmind-bkt/reef-slides/",)
+# Keep the checked-in default aligned with the beta/dev tile-server policy.
+# Callers may still narrow or extend this explicitly with
+# WSI_ALLOWED_SOURCE_PREFIXES or --allowed-source-prefix, but a release must
+# not silently classify the pathology/ocra roots as incomplete merely because
+# the exporter was run without an environment override.
+_DEFAULT_SOURCE_PREFIXES = (
+    "s3://pathology/",
+    "s3://mskmind-bkt/",
+    "s3://ocra/",
+)
 _THUMBNAIL_PREFIX = "s3://mskmind-bkt/wsi-thumbnails/"
 _DEID_DATE_PATTERNS = (
     re.compile(r'(?<!\d)(?:19|20)\d{2}[-_/](?:0?[1-9]|1[0-2])[-_/](?:0?[1-9]|[12]\d|3[01])(?!\d)'),
@@ -259,6 +278,9 @@ SELECT c.patient_id, c.reference_sample_id, c.sample_id, c.match_level,
        c.is_ihc, c.magnification, c.file_size_bytes, c.barcode, c.slide_type,
        c.specimen_key, c.can_serve_tiles, c.slide_path,
        c.timeline_start_days, c.timeline_date_status,
+       c.timeline_date_kind, c.timeline_date_source,
+       c.timeline_date_reason,
+       c.timeline_coordinate_system,
        NULL AS slide_timepoint_source,
        r.tile_metadata_json, r.artifact_uri, r.width, r.height,
        r.content_type, r.serving_artifact_uri, r.serving_width, r.serving_height,
@@ -270,19 +292,6 @@ LEFT JOIN ranked_registry r
  AND r.rn = 1
 WHERE c.patient_id LIKE 'P-%'
 """
-
-
-def _legacy_query_sql(canonical: str, registry: str) -> str:
-    """Build the same export query for a pre-migration canonical table."""
-    query = _query_sql(canonical, registry)
-    query = query.replace(
-        "c.timeline_start_days, c.timeline_date_status,\n       NULL AS slide_timepoint_source,",
-        "c.procedure_date_days AS timeline_start_days, "
-        "CASE WHEN c.procedure_date_days IS NOT NULL THEN 'AVAILABLE' "
-        "ELSE 'MISSING_PROCEDURE_DATE' END AS timeline_date_status, "
-        "c.timepoint_source AS slide_timepoint_source,",
-    )
-    return query
 
 
 def _run_external_query(sql: str, warehouse_id: str) -> Iterable[dict[str, Any]]:
@@ -324,21 +333,8 @@ def _run_external_query(sql: str, warehouse_id: str) -> Iterable[dict[str, Any]]
 def _run_export_query(
     canonical: str, registry: str, warehouse_id: str
 ) -> Iterable[dict[str, Any]]:
-    """Read the current contract, retrying once against a pre-migration table.
-
-    Databricks reports unresolved columns only after statement execution.  The
-    query is therefore wrapped as a generator: no partial rows are yielded
-    before the statement succeeds, so the legacy retry cannot duplicate data.
-    """
-    try:
-        yield from _run_external_query(_query_sql(canonical, registry), warehouse_id)
-    except RuntimeError as error:
-        message = str(error).lower()
-        if "timeline_start_days" not in message and "timeline_date_status" not in message:
-            raise
-        yield from _run_external_query(
-            _legacy_query_sql(canonical, registry), warehouse_id
-        )
+    """Read only the versioned portal-coordinate canonical contract."""
+    yield from _run_external_query(_query_sql(canonical, registry), warehouse_id)
 
 
 def _text(value: Any) -> str:
@@ -482,6 +478,20 @@ def _row(
     source_is_allowed = any(source.startswith(prefix) for prefix in (allowed_source_prefixes or _source_prefixes()))
     if canonical_can_serve:
         asset_stats["canonical_servable"] = asset_stats.get("canonical_servable", 0) + 1
+        if not source:
+            asset_stats["source_missing"] = asset_stats.get("source_missing", 0) + 1
+        elif not source_is_allowed:
+            asset_stats["source_disallowed"] = asset_stats.get("source_disallowed", 0) + 1
+        if not artifact.startswith(_THUMBNAIL_PREFIX):
+            asset_stats["thumbnail_missing_or_invalid"] = asset_stats.get(
+                "thumbnail_missing_or_invalid", 0
+            ) + 1
+        if not metadata_valid:
+            asset_stats["tile_metadata_invalid"] = asset_stats.get(
+                "tile_metadata_invalid", 0
+            ) + 1
+    else:
+        asset_stats["explicit_nonservable"] = asset_stats.get("explicit_nonservable", 0) + 1
     can_serve = (
         canonical_can_serve
         and not registry_failed
@@ -551,14 +561,14 @@ def _write(study_id: str, output_dir: Path, rows: Iterable[list[str]], stats: di
     data_path = output_dir / "data_wsi.txt"
     manifest_path = output_dir / "wsi_snapshot_manifest.json"
     tmp_data = data_path.with_suffix(".txt.tmp")
-    meta_path.write_text("\n".join((f"cancer_study_identifier: {study_id}", "genetic_alteration_type: PATHOLOGY_SLIDES", "datatype: WSI", "data_filename: data_wsi.txt", "format_version: 2", "")), encoding="utf-8")
+    meta_path.write_text("\n".join((f"cancer_study_identifier: {study_id}", "genetic_alteration_type: PATHOLOGY_SLIDES", "datatype: WSI", "data_filename: data_wsi.txt", "format_version: 3", "")), encoding="utf-8")
     with tmp_data.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t", lineterminator="\n", quoting=csv.QUOTE_NONE, quotechar=None)
-        writer.writerow([f"#{name}" for name in DATA_COLUMNS])
-        writer.writerow([f"#{_DESCRIPTIONS[name]}" for name in DATA_COLUMNS])
-        writer.writerow(["#BOOLEAN" if name in _BOOLEAN_COLUMNS else "#NUMBER" if name in _INTEGER_COLUMNS else "#STRING" for name in DATA_COLUMNS])
-        writer.writerow(["#0"] * len(DATA_COLUMNS))
-        writer.writerow(DATA_COLUMNS)
+        writer.writerow([f"#{name}" for name in WSI_FILE_COLUMNS])
+        writer.writerow([f"#{_DESCRIPTIONS.get(name, name)}" for name in WSI_FILE_COLUMNS])
+        writer.writerow(["#BOOLEAN" if name in _BOOLEAN_COLUMNS else "#NUMBER" if name in _INTEGER_COLUMNS else "#STRING" for name in WSI_FILE_COLUMNS])
+        writer.writerow(["#0"] * len(WSI_FILE_COLUMNS))
+        writer.writerow(WSI_FILE_COLUMNS)
         for values in rows:
             writer.writerow(values)
     os.replace(tmp_data, data_path)
@@ -572,6 +582,11 @@ def _write(study_id: str, output_dir: Path, rows: Iterable[list[str]], stats: di
         "incomplete_asset_count": stats.get("incomplete", 0),
         "registry_failed_asset_count": stats.get("registry_failed", 0),
         "registry_invalid_asset_count": stats.get("registry_invalid", 0),
+        "explicit_nonservable_row_count": stats.get("explicit_nonservable", 0),
+        "source_missing_count": stats.get("source_missing", 0),
+        "source_disallowed_count": stats.get("source_disallowed", 0),
+        "thumbnail_missing_or_invalid_count": stats.get("thumbnail_missing_or_invalid", 0),
+        "tile_metadata_invalid_count": stats.get("tile_metadata_invalid", 0),
         "cohort_rows_seen": stats.get("cohort_rows_seen", 0),
         "filtered_row_count": stats.get("filtered_rows", 0),
         "timeline_event_count": stats.get("timeline_events", 0),
@@ -587,6 +602,8 @@ def _timeline_record(values: list[str]) -> dict[str, Any]:
         return values[DATA_COLUMNS.index(name)]
 
     timing_offset = len(DATA_COLUMNS)
+    timing = values[timing_offset:]
+    timing.extend([""] * (len(TIMELINE_COLUMNS) - len(timing)))
     return {
         "patient_id": value("PATIENT_ID"),
         "sample_id": value("SAMPLE_ID") or None,
@@ -605,10 +622,35 @@ def _timeline_record(values: list[str]) -> dict[str, Any]:
         "slide_path": value("SOURCE_URL"),
         "can_serve_tiles": value("CAN_SERVE_TILES") == "TRUE",
         "specimen_key": value("SPECIMEN_KEY"),
-        "timeline_start_days": values[timing_offset] or None,
-        "timeline_date_status": values[timing_offset + 1] or None,
-        "slide_timepoint_source": values[timing_offset + 2] or None,
+        "timeline_start_days": timing[0] or None,
+        "timeline_date_status": timing[1] or None,
+        "timeline_date_kind": timing[2] or None,
+        "timeline_date_source": timing[3] or None,
+        "timeline_date_reason": timing[4] or None,
+        "timeline_coordinate_system": timing[5] or None,
+        "slide_timepoint_source": timing[6] or None,
     }
+
+
+def _timeline_values(record: dict[str, Any]) -> list[str]:
+    """Serialize v3 timing fields without treating day zero as missing."""
+    values: list[str] = []
+    for field in TIMELINE_COLUMNS:
+        value = record.get(field)
+        if field == "slide_timepoint_source" and not value:
+            kind = str(record.get("timeline_date_kind") or "").strip().upper()
+            if kind == "ESTIMATED":
+                value = "Verified estimated procedure date relative to first tumor sequencing"
+            elif kind == "RECORDED":
+                value = "Recorded procedure date relative to first tumor sequencing"
+            else:
+                value = (
+                    record.get("timeline_date_reason")
+                    or record.get("timeline_date_source")
+                    or record.get("timeline_date_status")
+                )
+        values.append("" if value is None else str(value))
+    return values
 
 
 def main() -> int:
@@ -623,6 +665,11 @@ def main() -> int:
         "incomplete": 0,
         "registry_failed": 0,
         "registry_invalid": 0,
+        "explicit_nonservable": 0,
+        "source_missing": 0,
+        "source_disallowed": 0,
+        "thumbnail_missing_or_invalid": 0,
+        "tile_metadata_invalid": 0,
     }
     duplicate_count = 0
     scanned = 0
@@ -651,9 +698,7 @@ def main() -> int:
         # Keep the timing fields alongside the selected WSI association.  They
         # are private exporter state and are removed before data_wsi.txt is
         # written; the cBioPortal WSI contract never exposes procedure dates.
-        values.extend(
-            str(record.get(field) or "") for field in TIMELINE_COLUMNS
-        )
+        values.extend(_timeline_values(record))
         if previous is not None:
             duplicate_count += 1
             # A slide can have more than one canonical association.  The
@@ -724,16 +769,13 @@ def main() -> int:
         )
     timeline_records = [_timeline_record(row) for row in output_rows]
     timeline_rows = build_pathology_timeline_rows(timeline_records, study_id)
-    if not timeline_rows:
-        raise ValueError(
-            "the requested study has no dated pathology associations; refusing "
-            "to publish a WSI snapshot without timeline events"
-        )
+    # A valid study can contain only undated slides.  The WSI hierarchy keeps
+    # those associations for the separate undated UI section; an empty
+    # pathology timeline file is valid and must not block the snapshot.
     timeline_meta, timeline_data, timeline_event_count = write_pathology_timeline_files(
         output_dir, study_id, timeline_records
     )
-    # Strip the private timing tail before serializing the WSI table.
-    wsi_rows = [row[: len(DATA_COLUMNS)] for row in output_rows]
+    wsi_rows = output_rows
     servable_patients = {row[DATA_COLUMNS.index("PATIENT_ID")] for row in output_rows if row[DATA_COLUMNS.index("CAN_SERVE_TILES")] == "TRUE"}
     _write(
         study_id,

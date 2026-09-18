@@ -85,6 +85,121 @@ class PortalTileContractTests(unittest.TestCase):
         )
         self.assertIn('VERIFY_ALL_ACCESS:-1', E2E_SCRIPT)
 
+    def _valid_staging_row(self, *, can_serve: str = "FALSE"):
+        values = [""] * len(HYDRATE.DATA_COLUMNS)
+        for name, value in {
+            "PATIENT_ID": "P-1",
+            "IMAGE_ID": "slide-1",
+            "MATCH_LEVEL": "UNMATCHED",
+            "SPECIMEN_KEY": "unmatched::part:unknown::block:unknown",
+            "CAN_SERVE_TILES": can_serve,
+        }.items():
+            values[HYDRATE.DATA_COLUMNS.index(name)] = value
+        timing = [
+            "0",
+            "AVAILABLE",
+            "RECORDED",
+            "procedure_date",
+            "",
+            HYDRATE.TIMELINE_COORDINATE_SYSTEM,
+            "Recorded procedure date relative to first tumor sequencing",
+        ]
+        return values, timing
+
+    def test_staging_validation_rejects_legacy_snapshot_before_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            db = HYDRATE.sqlite3.connect(Path(temporary) / "legacy.sqlite")
+            db.execute(
+                "CREATE TABLE slides (study_id INTEGER, patient_internal INTEGER, image_id TEXT, "
+                "sample_internal INTEGER, reference_internal INTEGER, rank_key TEXT, "
+                "values_json TEXT, timing_json TEXT)"
+            )
+            values, timing = self._valid_staging_row()
+            db.execute(
+                "INSERT INTO slides VALUES(?,?,?,?,?,?,?,?)",
+                (1, 1, "slide-1", None, None, "2|1|1|", json.dumps(values), json.dumps(timing[:4])),
+            )
+            db.commit()
+            with self.assertRaisesRegex(RuntimeError, "missing v3 metadata"):
+                HYDRATE._validate_staging(
+                    db,
+                    selected_study_ids={1},
+                    prefixes=("s3://pathology/",),
+                    timeline_generator_sha="",
+                    derived_tables_sql_sha256="derived",
+                    allow_incomplete_assets=False,
+                )
+            db.close()
+
+    def test_staging_validation_checks_v3_rows_and_release_bindings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            db = HYDRATE.sqlite3.connect(Path(temporary) / "valid.sqlite")
+            HYDRATE._create_staging_schema(db)
+            values, timing = self._valid_staging_row()
+            db.execute(
+                "INSERT INTO slides VALUES(?,?,?,?,?,?,?,?)",
+                (1, 1, "slide-1", None, None, "2|1|1|", json.dumps(values), json.dumps(timing)),
+            )
+            stats = {"selected_rows": 1, "study_count": 1, "incomplete": 0}
+            prefixes = ("s3://pathology/", "s3://mskmind-bkt/", "s3://ocra/")
+            HYDRATE._write_staging_metadata(
+                db,
+                selected_study_ids={1},
+                prefixes=prefixes,
+                timeline_generator_sha="",
+                derived_tables_sql_sha256="derived",
+                stats=stats,
+                diagnostic=False,
+            )
+            validated = HYDRATE._validate_staging(
+                db,
+                selected_study_ids={1},
+                prefixes=prefixes,
+                timeline_generator_sha="",
+                derived_tables_sql_sha256="derived",
+                allow_incomplete_assets=False,
+            )
+            self.assertEqual(validated["selected_rows"], 1)
+            with self.assertRaisesRegex(RuntimeError, "does not match"):
+                HYDRATE._validate_staging(
+                    db,
+                    selected_study_ids={1},
+                    prefixes=("s3://ocra/",),
+                    timeline_generator_sha="",
+                    derived_tables_sql_sha256="derived",
+                    allow_incomplete_assets=False,
+                )
+            db.close()
+
+    def test_staging_validation_rejects_incomplete_servable_bundle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            db = HYDRATE.sqlite3.connect(Path(temporary) / "incomplete.sqlite")
+            HYDRATE._create_staging_schema(db)
+            values, timing = self._valid_staging_row(can_serve="TRUE")
+            db.execute(
+                "INSERT INTO slides VALUES(?,?,?,?,?,?,?,?)",
+                (1, 1, "slide-1", None, None, "2|1|0|", json.dumps(values), json.dumps(timing)),
+            )
+            HYDRATE._write_staging_metadata(
+                db,
+                selected_study_ids={1},
+                prefixes=("s3://pathology/",),
+                timeline_generator_sha="",
+                derived_tables_sql_sha256="derived",
+                stats={"selected_rows": 1, "study_count": 1, "incomplete": 1},
+                diagnostic=True,
+            )
+            with self.assertRaisesRegex(RuntimeError, "incomplete asset bundle"):
+                HYDRATE._validate_staging(
+                    db,
+                    selected_study_ids={1},
+                    prefixes=("s3://pathology/",),
+                    timeline_generator_sha="",
+                    derived_tables_sql_sha256="derived",
+                    allow_incomplete_assets=True,
+                )
+            db.close()
+
     def test_production_inventory_is_derived_from_canonical_patient_sample_overlap(self):
         args = Namespace(
             canonical_table="prod.canonical.associations",
@@ -125,6 +240,9 @@ class PortalTileContractTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value["inventory_sha256"] = HYDRATE._inventory_sha256(value)
+            path.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "does not match"):
                 HYDRATE._read_study_inventory(
                     path,
@@ -139,7 +257,8 @@ class PortalTileContractTests(unittest.TestCase):
         self.assertIn("ALTER TABLE structural_variant DELETE", MOLECULAR_HYDRATE_SCRIPT)
         self.assertIn("ImportCopyNumberSegmentData", MOLECULAR_HYDRATE_SCRIPT)
         self.assertIn("ImportGenePanelProfileMap", MOLECULAR_HYDRATE_SCRIPT)
-        self.assertIn('(\"IMAGE_IDS\", json.dumps(sorted(group[\"images\"])))', HYDRATE_SCRIPT)
+        self.assertIn("build_pathology_timeline_rows", HYDRATE_SCRIPT)
+        self.assertNotIn("groups.setdefault(key", HYDRATE_SCRIPT)
         self.assertIn('profile_id "$mutation_meta" MUTATION_EXTENDED', MOLECULAR_HYDRATE_SCRIPT)
         self.assertIn('stable_id = \'$stable_id\'', MOLECULAR_HYDRATE_SCRIPT)
         self.assertNotIn("VERIFY_AFTER_HYDRATION", MOLECULAR_HYDRATE_SCRIPT)
@@ -601,6 +720,13 @@ class DatabricksExportContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid S3 prefix"):
             EXPORT._source_prefixes(["s3://"])
 
+    def test_default_source_prefixes_match_tile_server_policy(self):
+        with mock.patch.dict(EXPORT.os.environ, {EXPORT._SOURCE_PREFIX_ENV: ""}, clear=False):
+            self.assertEqual(
+                EXPORT._source_prefixes(),
+                ("s3://pathology/", "s3://mskmind-bkt/", "s3://ocra/"),
+            )
+
     def test_timeline_record_uses_final_wsi_capability(self):
         values = [""] * len(EXPORT.DATA_COLUMNS)
         for name, value in {
@@ -614,7 +740,7 @@ class DatabricksExportContractTests(unittest.TestCase):
             "CAN_SERVE_TILES": "FALSE",
         }.items():
             values[EXPORT.DATA_COLUMNS.index(name)] = value
-        values.extend(("-5", "AVAILABLE", "source"))
+        values.extend(("-5", "AVAILABLE", "patient_first_tumor_sequencing_day_zero", "source"))
 
         record = EXPORT._timeline_record(values)
 
@@ -635,7 +761,10 @@ class ReleaseManifestTests(unittest.TestCase):
                     {
                         "version": 1,
                         "catalog_policy": "contains",
-                        "inventory": {"kind": "canonical_impact_sample_membership"},
+                        "inventory": {
+                            "kind": "canonical_impact_sample_membership",
+                            "studies": [{"study_id": "study_a"}],
+                        },
                         "studies": [
                             {
                                 "study_id": "study_a",
@@ -647,9 +776,49 @@ class ReleaseManifestTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            value = json.loads(manifest.read_text(encoding="utf-8"))
+            value["inventory"]["inventory_sha256"] = STACK._inventory_sha256(value["inventory"])
+            manifest.write_text(json.dumps(value), encoding="utf-8")
             policy, studies = STACK._read_manifest(manifest)
             self.assertEqual(policy, "contains")
             self.assertFalse(studies[0]["require_wsi"])
+
+    def test_contains_manifest_rejects_inventory_coverage_gap(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            study_dir = Path(temporary) / "study"
+            study_dir.mkdir()
+            (study_dir / "meta_study.txt").write_text(
+                "cancer_study_identifier: study_a\n", encoding="utf-8"
+            )
+            manifest = Path(temporary) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "catalog_policy": "contains",
+                        "inventory": {
+                            "kind": "canonical_impact_sample_membership",
+                            "studies": [
+                                {"study_id": "study_a"},
+                                {"study_id": "study_b"},
+                            ],
+                        },
+                        "studies": [
+                            {
+                                "study_id": "study_a",
+                                "study_dir": str(study_dir),
+                                "require_wsi": False,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            value = json.loads(manifest.read_text(encoding="utf-8"))
+            value["inventory"]["inventory_sha256"] = STACK._inventory_sha256(value["inventory"])
+            manifest.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaisesRegex(STACK.VerificationError, "coverage does not match"):
+                STACK._read_manifest(manifest)
 
     def test_manifest_requires_pixel_snapshot_and_complete_timeline_pair(self):
         with tempfile.TemporaryDirectory() as temporary:

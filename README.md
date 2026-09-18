@@ -90,8 +90,10 @@ Create a host-local manifest from the exact snapshot directories used by the
 import. Start with [`stack-release-manifest.example.json`](stack-release-manifest.example.json).
 For dev, use `catalog_policy: exact` and list the deliberately selected
 representative studies. For beta, use `catalog_policy: contains`, include
-`canonical_impact_sample_membership` inventory metadata, and list every study
-in the frozen production IMPACT inventory. Each listed study's snapshot must
+`canonical_impact_sample_membership` inventory metadata with its generated
+`inventory_sha256`, and list every study in the frozen production IMPACT
+inventory. The verifier requires the manifest study set to equal the frozen
+inventory study set. Each listed study's snapshot must
 contain `meta_wsi.txt`, `data_wsi.txt`,
 `wsi_snapshot_manifest.json`, and a valid `data_filename` for every other
 `meta_*.txt` declaration. A WSI release must include the generated pathology

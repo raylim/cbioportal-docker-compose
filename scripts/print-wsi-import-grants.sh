@@ -21,7 +21,7 @@ grant() {
   printf 'GRANT %s ON %s.%s TO %s;\n' "$1" "$database" "$2" "$role"
 }
 
-for table in wsi_patient clinical_event clinical_event_data sample_profile \
+for table in wsi_patient wsi_slide_timing clinical_event clinical_event_data sample_profile \
   sample_to_gene_panel_derived gene_panel_to_gene_derived sample_derived \
   genomic_event_derived clinical_data_derived clinical_event_derived \
   clinical_event_data_derived genetic_alteration_derived generic_assay_data_derived \
@@ -29,7 +29,7 @@ for table in wsi_patient clinical_event clinical_event_data sample_profile \
   grant INSERT "$table"
 done
 
-for table in wsi_patient wsi_part wsi_block wsi_slide wsi_slide_placement \
+for table in wsi_patient wsi_part wsi_block wsi_slide wsi_slide_placement wsi_slide_timing \
   clinical_attribute_meta clinical_sample clinical_patient clinical_event clinical_event_data; do
   grant "ALTER DELETE" "$table"
 done

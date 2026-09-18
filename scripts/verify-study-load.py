@@ -284,7 +284,12 @@ def _parse_wsi_file(study_dir: Path) -> dict[str, Any]:
     if header_index is None:
         raise VerificationError("WSI data file has no header")
     header = lines[header_index].split("\t")
-    required = {"PATIENT_ID", "IMAGE_ID", "CAN_SERVE_TILES"}
+    required = {
+        "PATIENT_ID", "IMAGE_ID", "CAN_SERVE_TILES",
+        "TIMELINE_START_DAYS", "TIMELINE_DATE_STATUS",
+        "TIMELINE_DATE_KIND", "TIMELINE_DATE_SOURCE",
+        "TIMELINE_COORDINATE_SYSTEM",
+    }
     missing = sorted(required.difference(header))
     if missing:
         raise VerificationError(f"WSI data header is missing: {', '.join(missing)}")

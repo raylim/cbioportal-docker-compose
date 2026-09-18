@@ -61,6 +61,16 @@ WSI_ATTRS = (
 )
 
 DATA_COLUMNS = exporter.DATA_COLUMNS
+STAGING_SCHEMA_VERSION = "1"
+WSI_FORMAT_VERSION = "3"
+STAGING_METADATA_TABLE = "staging_metadata"
+TIMELINE_COORDINATE_SYSTEM = "patient_first_tumor_sequencing_day_zero"
+TIMELINE_STATUSES = {
+    "AVAILABLE",
+    "MISSING_PROCEDURE_DATE",
+    "MISSING_REFERENCE_SEQUENCING_DATE",
+}
+TIMELINE_KINDS = {"RECORDED", "ESTIMATED", "UNDATED"}
 
 
 def _args() -> argparse.Namespace:
@@ -174,6 +184,7 @@ def _check_import_permissions(args: argparse.Namespace) -> None:
         "wsi_block",
         "wsi_slide",
         "wsi_slide_placement",
+        "wsi_slide_timing",
     )
     clinical_tables = (
         "clinical_attribute_meta",
@@ -435,6 +446,12 @@ def _inventory_from_source(
     }
 
 
+def _inventory_sha256(value: dict[str, Any]) -> str:
+    payload = {key: item for key, item in value.items() if key != "inventory_sha256"}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _read_study_inventory(
     path: Path, canonical_table: str, registry_table: str, warehouse_id: str
 ) -> list[str]:
@@ -446,6 +463,11 @@ def _read_study_inventory(
         raise RuntimeError("study inventory must have version 1")
     if value.get("kind") != "canonical_impact_sample_membership":
         raise RuntimeError("study inventory is not a canonical IMPACT inventory")
+    declared_digest = value.get("inventory_sha256")
+    if not isinstance(declared_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", declared_digest):
+        raise RuntimeError("study inventory must contain a valid inventory_sha256")
+    if declared_digest != _inventory_sha256(value):
+        raise RuntimeError("study inventory checksum does not match its contents")
     for key, expected in (
         ("canonical_table", canonical_table),
         ("registry_table", registry_table),
@@ -507,6 +529,232 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _create_staging_schema(db: sqlite3.Connection) -> None:
+    """Create the versioned, self-describing staging database schema."""
+    db.execute(
+        """CREATE TABLE slides (
+            study_id INTEGER NOT NULL,
+            patient_internal INTEGER NOT NULL,
+            image_id TEXT NOT NULL,
+            sample_internal INTEGER,
+            reference_internal INTEGER,
+            rank_key TEXT NOT NULL,
+            values_json TEXT NOT NULL,
+            timing_json TEXT NOT NULL,
+            PRIMARY KEY(study_id, patient_internal, image_id)
+        )"""
+    )
+    db.execute(
+        f"""CREATE TABLE {STAGING_METADATA_TABLE} (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )"""
+    )
+
+
+def _write_staging_metadata(
+    db: sqlite3.Connection,
+    *,
+    selected_study_ids: set[int],
+    prefixes: tuple[str, ...],
+    timeline_generator_sha: str,
+    derived_tables_sql_sha256: str,
+    stats: dict[str, Any],
+    diagnostic: bool,
+) -> None:
+    """Bind a staging snapshot to the exact release inputs that produced it."""
+    metadata = {
+        "staging_schema_version": STAGING_SCHEMA_VERSION,
+        "wsi_format_version": WSI_FORMAT_VERSION,
+        "data_columns": list(DATA_COLUMNS),
+        "timeline_columns": list(exporter.TIMELINE_COLUMNS),
+        "selected_study_ids": sorted(int(value) for value in selected_study_ids),
+        "allowed_source_prefixes": list(prefixes),
+        "timeline_generator_sha": timeline_generator_sha,
+        "derived_tables_sql_sha256": derived_tables_sql_sha256,
+        "diagnostic_incomplete_assets": bool(diagnostic),
+        "stats": {key: int(value) for key, value in stats.items() if isinstance(value, int)},
+    }
+    db.executemany(
+        f"INSERT INTO {STAGING_METADATA_TABLE}(key,value) VALUES(?,?)",
+        ((key, json.dumps(value, sort_keys=True, separators=(",", ":")))
+         for key, value in metadata.items()),
+    )
+    db.commit()
+
+
+def _read_staging_metadata(db: sqlite3.Connection) -> dict[str, Any]:
+    table = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (STAGING_METADATA_TABLE,),
+    ).fetchone()
+    if not table:
+        raise RuntimeError(
+            "staging snapshot is missing v3 metadata; refusing to mutate ClickHouse "
+            "(legacy staging databases are not resumable)"
+        )
+    rows = db.execute(f"SELECT key,value FROM {STAGING_METADATA_TABLE}").fetchall()
+    metadata: dict[str, Any] = {}
+    try:
+        for key, value in rows:
+            metadata[str(key)] = json.loads(value)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("staging snapshot has invalid metadata; refusing to mutate ClickHouse") from exc
+    required = {
+        "staging_schema_version",
+        "wsi_format_version",
+        "data_columns",
+        "timeline_columns",
+        "selected_study_ids",
+        "allowed_source_prefixes",
+        "timeline_generator_sha",
+        "derived_tables_sql_sha256",
+        "diagnostic_incomplete_assets",
+        "stats",
+    }
+    missing = sorted(required - set(metadata))
+    if missing:
+        raise RuntimeError(
+            "staging snapshot metadata is incomplete; missing " + ", ".join(missing)
+        )
+    return metadata
+
+
+def _validate_staging(
+    db: sqlite3.Connection,
+    *,
+    selected_study_ids: set[int],
+    prefixes: tuple[str, ...],
+    timeline_generator_sha: str,
+    derived_tables_sql_sha256: str,
+    allow_incomplete_assets: bool,
+) -> dict[str, int]:
+    """Validate all staged rows before any target-table cleanup is possible."""
+    slides = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='slides'"
+    ).fetchone()
+    if not slides:
+        raise RuntimeError("staging database has no slides table; refusing to mutate ClickHouse")
+    metadata = _read_staging_metadata(db)
+    expected_metadata = {
+        "staging_schema_version": STAGING_SCHEMA_VERSION,
+        "wsi_format_version": WSI_FORMAT_VERSION,
+        "data_columns": list(DATA_COLUMNS),
+        "timeline_columns": list(exporter.TIMELINE_COLUMNS),
+        "selected_study_ids": sorted(int(value) for value in selected_study_ids),
+        "allowed_source_prefixes": list(prefixes),
+        "timeline_generator_sha": timeline_generator_sha,
+        "derived_tables_sql_sha256": derived_tables_sql_sha256,
+    }
+    for key, expected in expected_metadata.items():
+        if metadata.get(key) != expected:
+            raise RuntimeError(
+                f"staging snapshot {key} does not match the requested release inputs"
+            )
+    if metadata.get("diagnostic_incomplete_assets") and not allow_incomplete_assets:
+        raise RuntimeError(
+            "staging snapshot was created with diagnostic incomplete-asset mode; "
+            "refusing to use it for a strict release"
+        )
+
+    stats_value = metadata.get("stats")
+    if not isinstance(stats_value, dict):
+        raise RuntimeError("staging snapshot has invalid stage statistics")
+    actual_rows = int(db.execute("SELECT count(*) FROM slides").fetchone()[0])
+    actual_studies = {
+        int(row[0]) for row in db.execute("SELECT DISTINCT study_id FROM slides")
+    }
+    if actual_rows != int(stats_value.get("selected_rows", -1)):
+        raise RuntimeError("staging snapshot row count does not match its metadata")
+    if len(actual_studies) != int(stats_value.get("study_count", -1)):
+        raise RuntimeError("staging snapshot study count does not match its metadata")
+    if actual_studies != selected_study_ids:
+        raise RuntimeError("staging database study scope does not match the selected release inventory")
+    if actual_rows == 0:
+        raise RuntimeError("staging snapshot is empty; refusing to mutate ClickHouse")
+
+    can_serve_index = DATA_COLUMNS.index("CAN_SERVE_TILES")
+    source_index = DATA_COLUMNS.index("SOURCE_URL")
+    metadata_index = DATA_COLUMNS.index("TILE_METADATA_JSON")
+    thumbnail_index = DATA_COLUMNS.index("THUMBNAIL_URL")
+    width_index = DATA_COLUMNS.index("THUMBNAIL_WIDTH")
+    height_index = DATA_COLUMNS.index("THUMBNAIL_HEIGHT")
+    content_type_index = DATA_COLUMNS.index("THUMBNAIL_CONTENT_TYPE")
+    for row_number, row in enumerate(
+        db.execute(
+            "SELECT study_id,values_json,timing_json FROM slides "
+            "ORDER BY study_id,patient_internal,image_id"
+        ),
+        start=1,
+    ):
+        study_id, values_json, timing_json = row
+        try:
+            values = json.loads(values_json)
+            timing = json.loads(timing_json)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"staging row {row_number} contains invalid JSON") from exc
+        if not isinstance(values, list) or len(values) != len(DATA_COLUMNS):
+            raise RuntimeError(
+                f"staging row {row_number} does not use WSI format v3 ({len(DATA_COLUMNS)} data columns)"
+            )
+        if not isinstance(timing, list) or len(timing) != len(exporter.TIMELINE_COLUMNS):
+            raise RuntimeError(
+                f"staging row {row_number} does not use the v3 seven-field timeline contract"
+            )
+        if str(values[can_serve_index]).upper() not in {"TRUE", "FALSE"}:
+            raise RuntimeError(f"staging row {row_number} has invalid CAN_SERVE_TILES")
+        if str(values[can_serve_index]).upper() == "TRUE":
+            if not all(str(values[index]).strip() for index in (
+                source_index, metadata_index, thumbnail_index, width_index,
+                height_index, content_type_index,
+            )):
+                raise RuntimeError(f"servable staging row {row_number} has an incomplete asset bundle")
+            if not any(str(values[source_index]).startswith(prefix) for prefix in prefixes):
+                raise RuntimeError(f"servable staging row {row_number} uses a disallowed source prefix")
+            if not str(values[thumbnail_index]).startswith(exporter._THUMBNAIL_PREFIX):
+                raise RuntimeError(f"servable staging row {row_number} uses an invalid thumbnail prefix")
+            try:
+                tile_metadata = json.loads(values[metadata_index])
+                width = int(values[width_index])
+                height = int(values[height_index])
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"servable staging row {row_number} has invalid asset metadata") from exc
+            if width <= 0 or height <= 0 or not exporter._metadata_is_safe_and_valid(tile_metadata):
+                raise RuntimeError(f"servable staging row {row_number} has invalid asset metadata")
+
+        status = str(timing[1] or "").strip().upper()
+        kind = str(timing[2] or "").strip().upper()
+        start = str(timing[0] or "").strip()
+        reason = str(timing[4] or "").strip()
+        coordinate_system = str(timing[5] or "").strip()
+        if status not in TIMELINE_STATUSES or kind not in TIMELINE_KINDS:
+            raise RuntimeError(f"staging row {row_number} has invalid v3 timeline status/kind")
+        if coordinate_system != TIMELINE_COORDINATE_SYSTEM:
+            raise RuntimeError(f"staging row {row_number} has an unsupported timeline coordinate system")
+        if status == "AVAILABLE":
+            try:
+                int(start)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"staging row {row_number} has an invalid available timeline offset") from exc
+            if kind == "UNDATED" or reason:
+                raise RuntimeError(f"staging row {row_number} has inconsistent AVAILABLE timing")
+        elif start:
+            raise RuntimeError(f"staging row {row_number} has an offset for non-AVAILABLE timing")
+        if status == "MISSING_PROCEDURE_DATE" and kind != "UNDATED":
+            raise RuntimeError(f"staging row {row_number} has an invalid missing-procedure timing kind")
+        if status == "MISSING_REFERENCE_SEQUENCING_DATE" and kind == "UNDATED":
+            raise RuntimeError(f"staging row {row_number} has an invalid missing-reference timing kind")
+        if not str(timing[6] or "").strip():
+            raise RuntimeError(f"staging row {row_number} has no timepoint source")
+    validated_stats = {
+        key: int(value)
+        for key, value in stats_value.items()
+        if isinstance(value, int) and not isinstance(value, bool)
+    }
+    validated_stats.update({"selected_rows": actual_rows, "study_count": len(actual_studies)})
+    return validated_stats
+
+
 def _rank(values: list[str]) -> str:
     levels = {"BLOCK": "0", "PART": "1", "UNMATCHED": "2"}
     return "{}|{}|{}|{}".format(
@@ -560,7 +808,7 @@ def _stage(args: argparse.Namespace, db: sqlite3.Connection, patient_targets, sa
             row_key = (study_id, patient_internal, values[DATA_COLUMNS.index("IMAGE_ID")])
             rank_key = _rank(values)
             payload = json.dumps(values, separators=(",", ":"))
-            timing = [str(record.get(name) or "") for name in exporter.TIMELINE_COLUMNS]
+            timing = exporter._timeline_values(record)
             timing_json = json.dumps(timing, separators=(",", ":"))
             db.execute(
                 """INSERT INTO slides(study_id,patient_internal,image_id,sample_internal,
@@ -589,7 +837,7 @@ def _stage(args: argparse.Namespace, db: sqlite3.Connection, patient_targets, sa
 
 def _cleanup(args: argparse.Namespace, study_ids: list[int]) -> None:
     ids = _sql_ids(study_ids)
-    for table in ("wsi_slide_placement", "wsi_slide", "wsi_block", "wsi_part", "wsi_patient"):
+    for table in ("wsi_slide_timing", "wsi_slide_placement", "wsi_slide", "wsi_block", "wsi_part", "wsi_patient"):
         _run_client(args, f"ALTER TABLE {table} DELETE WHERE cancer_study_id IN ({ids})")
     # ReplacingMergeTree does not remove old versions immediately, so remove
     # WSI count attributes before inserting this snapshot.  The subqueries are
@@ -688,6 +936,46 @@ def _populate_tables(args: argparse.Namespace, db: sqlite3.Connection, study_ids
     placements = ((study, patient, image, values[4], values[11], sample, values[14], values[15])
                   for study, patient, image, sample, values, timing in slide_rows(count_rows=False))
     _insert_stream(args, "wsi_slide_placement", ["cancer_study_id", "patient_id", "image_id", "part_key", "block_key", "sample_id", "match_level", "specimen_key"], placements, {5})
+    timings = (
+        (
+            study,
+            patient,
+            image,
+            int(timing[0]) if timing[0] else None,
+            timing[1] or "MISSING_PROCEDURE_DATE",
+            timing[2] or "UNDATED",
+            timing[3] or None,
+            timing[4] or None,
+            timing[5] or None,
+            timing[6]
+            or (
+                "Verified estimated procedure date relative to first tumor sequencing"
+                if timing[2] == "ESTIMATED"
+                else "Recorded procedure date relative to first tumor sequencing"
+                if timing[2] == "RECORDED"
+                else timing[4] or timing[3] or "Procedure date unavailable"
+            ),
+        )
+        for study, patient, image, _sample, _values, timing in slide_rows(count_rows=False)
+    )
+    _insert_stream(
+        args,
+        "wsi_slide_timing",
+        [
+            "cancer_study_id",
+            "patient_id",
+            "image_id",
+            "timeline_start_days",
+            "timeline_date_status",
+            "timeline_date_kind",
+            "timeline_date_source",
+            "timeline_date_reason",
+            "timeline_coordinate_system",
+            "timepoint_source",
+        ],
+        timings,
+        {3, 6, 7, 8, 9},
+    )
 
     # Attributes are inserted after old rows were removed.  Counts include all
     # selected associations, including explicitly non-servable slides.
@@ -702,68 +990,103 @@ def _populate_tables(args: argparse.Namespace, db: sqlite3.Connection, study_ids
                     for attr_id, value in zip((WSI_ATTRS[3][0], WSI_ATTRS[4][0], WSI_ATTRS[5][0]), values)))
 
 
-def _timeline_from_slides(db: sqlite3.Connection, study_stable_by_id: dict[int, str]) -> list[tuple[int, int, int | None, str, list[tuple[str, str]]]]:
-    """Build timeline events with the shared pathology grouping semantics."""
+def _timeline_association_rows(
+    db: sqlite3.Connection,
+    selected_study_id: int,
+) -> list[dict[str, Any]]:
+    """Convert staged slides to the shared timeline generator input shape."""
     if _TIMELINE_MODULE is None:
         raise RuntimeError("shared pathology timeline formatter is unavailable")
-    groups: dict[tuple[int, str, int, str, str, str, str], dict[str, Any]] = {}
-    for study, patient_internal, image, sample_internal, _reference, values_json, timing_json in _iter_slides(db):
+    index = {name: position for position, name in enumerate(DATA_COLUMNS)}
+    rows: list[dict[str, Any]] = []
+    for study, _patient_internal, image, _sample_internal, _reference, values_json, timing_json in _iter_slides(db):
+        if study != selected_study_id:
+            continue
         values = json.loads(values_json)
         timing = json.loads(timing_json)
-        start, status, source = timing
-        if not start or (status and status.upper() != "AVAILABLE"):
-            continue
-        try:
-            start_int = int(start)
-        except ValueError:
-            continue
-        subtype = _TIMELINE_MODULE._infer_slide_type(values[17] or None, values[16] or None,
-                                                      values[18] == "TRUE", values[19] == "TRUE")
-        if subtype is None:
-            continue
-        raw_match = values[14].upper()
-        match = _TIMELINE_MODULE._match_level_display_value(raw_match)
-        sample_display = values[2] if values[2] else _TIMELINE_MODULE._sample_display_value(None, raw_match)
-        specimen_key = values[15]
-        specimen = _TIMELINE_MODULE._format_specimen_label(
-            raw_match,
-            int(values[5]) if values[5] and values[5].isdigit() else None,
-            values[8] or None,
-            values[13] or None,
-            values[12] or "",
+        timing.extend([""] * (len(exporter.TIMELINE_COLUMNS) - len(timing)))
+        start, status, kind, date_source, reason, coordinate_system, source = timing
+        display_source = source or (
+            "Verified estimated procedure date relative to first tumor sequencing"
+            if kind == "ESTIMATED"
+            else "Recorded procedure date relative to first tumor sequencing"
+            if kind == "RECORDED"
+            else reason or date_source or status
         )
-        servable = values[24] == "TRUE"
-        grouping_token = specimen_key if servable else specimen
-        key = (study, values[0], start_int, sample_display, match, specimen, grouping_token, subtype)
-        group = groups.setdefault(key, {"images": set(), "servable": set(), "sources": set(), "patient": patient_internal})
-        group["images"].add(image)
-        (group["servable"] if servable else group.setdefault("nonservable", set())).add(image)
-        timepoint_source = ("Procedure date relative to first ICD-O diagnosis" if status.upper() == "AVAILABLE" else status or source)
-        if timepoint_source:
-            group["sources"].add(_TIMELINE_MODULE._clean_timeline_text(str(timepoint_source)))
+        rows.append({
+            "patient_id": values[index["PATIENT_ID"]],
+            "sample_id": values[index["SAMPLE_ID"]] or None,
+            "match_level": values[index["MATCH_LEVEL"]],
+            "image_id": image,
+            "part_key": values[index["PART_KEY"]],
+            "part_number": values[index["PART_NUMBER"]] or None,
+            "block_key": values[index["BLOCK_KEY"]],
+            "block_number": values[index["BLOCK_NUMBER"]] or None,
+            "block_label": values[index["BLOCK_LABEL"]] or None,
+            "part_description": values[index["PART_DESCRIPTION"]] or None,
+            "stain_name": values[index["STAIN_NAME"]] or None,
+            "stain_group": values[index["STAIN_GROUP"]] or None,
+            "is_hne": values[index["IS_HNE"]] == "TRUE",
+            "is_ihc": values[index["IS_IHC"]] == "TRUE",
+            "slide_path": values[index["SOURCE_URL"]] or None,
+            "can_serve_tiles": values[index["CAN_SERVE_TILES"]] == "TRUE",
+            "specimen_key": values[index["SPECIMEN_KEY"]],
+            "timeline_start_days": start or None,
+            "timeline_date_status": status or None,
+            "timeline_date_kind": kind or None,
+            "timeline_date_source": date_source or None,
+            "timeline_date_reason": reason or None,
+            "timeline_coordinate_system": coordinate_system or None,
+            "slide_timepoint_source": display_source or None,
+        })
+    return rows
+
+
+def _timeline_from_slides(
+    db: sqlite3.Connection,
+    study_stable_by_id: dict[int, str],
+    patient_targets: dict[str, list[tuple[int, int]]],
+) -> list[tuple[int, int, int | None, str, list[tuple[str, str]]]]:
+    """Build database events through the same generator used for study files."""
+    columns = _TIMELINE_MODULE.PATHOLOGY_TIMELINE_COLUMNS
     events = []
-    for key, group in sorted(groups.items()):
-        study, patient_stable, start, sample_display, match, specimen, _token, subtype = key
-        study_stable = study_stable_by_id[study]
-        servable_count = len(group["servable"])
-        nonservable_count = len(group.get("nonservable", set()))
-        linkout = _TIMELINE_MODULE._build_linkout(study_stable, patient_stable, sample_display, subtype, match, key[6], servable_count)
-        data = [("SAMPLE_ID", sample_display), ("SUBTYPE", subtype), ("MATCH_LEVEL", match),
-                ("SPECIMEN", specimen), ("IMAGE_COUNT", str(servable_count)),
-                ("NON_SERVABLE_IMAGE_COUNT", str(nonservable_count)),
-                ("TOTAL_IMAGE_COUNT", str(servable_count + nonservable_count)),
-                ("TIMEPOINT_SOURCE", ", ".join(sorted(group["sources"]))),
-                # Keep the exact slide membership alongside the aggregate counts.
-                # The release contract and verifier use this to prevent a stale
-                # count from silently representing a different set of slides.
-                ("IMAGE_IDS", json.dumps(sorted(group["images"]))),
-                ("LINKOUT", linkout)]
-        events.append((study, group["patient"], start, None, "PATHOLOGY SLIDES", data))
+    for study_internal, study_stable in sorted(study_stable_by_id.items()):
+        patient_internal_by_stable = {
+            stable_id: internal_id
+            for stable_id, matches in patient_targets.items()
+            for target_study, internal_id in matches
+            if target_study == study_internal
+        }
+        grouped_rows = _TIMELINE_MODULE.build_pathology_timeline_rows(
+            _timeline_association_rows(db, study_internal),
+            study_stable,
+        )
+        for row in grouped_rows:
+            record = dict(zip(columns, row))
+            patient_internal = patient_internal_by_stable.get(record["PATIENT_ID"])
+            if patient_internal is None:
+                raise RuntimeError(
+                    f"timeline patient is not present in the staged portal cohort: {record['PATIENT_ID']}"
+                )
+            data = [
+                (name, record[name])
+                for name in columns[4:]
+                if record[name] != ""
+            ]
+            events.append(
+                (study_internal, patient_internal, int(record["START_DATE"]), None,
+                 record["EVENT_TYPE"], data)
+            )
     return events
 
 
-def _insert_timeline(args: argparse.Namespace, db: sqlite3.Connection, study_stable_by_id: dict[int, str]) -> int:
-    events = _timeline_from_slides(db, study_stable_by_id)
+def _insert_timeline(
+    args: argparse.Namespace,
+    db: sqlite3.Connection,
+    study_stable_by_id: dict[int, str],
+    patient_targets: dict[str, list[tuple[int, int]]],
+) -> int:
+    events = _timeline_from_slides(db, study_stable_by_id, patient_targets)
     max_id_rows = _query_rows(args, "SELECT coalesce(max(clinical_event_id), 0) FROM clinical_event FORMAT TSV")
     next_id = int(max_id_rows[0][0]) if max_id_rows else 0
     event_rows = []
@@ -792,6 +1115,7 @@ def main() -> int:
     study_stable_by_id = {int(row[0]): row[1] for row in study_rows if row[1]}
     if args.write_study_inventory:
         inventory = _inventory_from_source(args, study_stable_by_id)
+        inventory["inventory_sha256"] = _inventory_sha256(inventory)
         args.write_study_inventory.parent.mkdir(parents=True, exist_ok=True)
         args.write_study_inventory.write_text(
             json.dumps(inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -812,6 +1136,7 @@ def main() -> int:
     args.derived_tables_sql = Path(args.derived_tables_sql).resolve()
     if not args.derived_tables_sql.is_file():
         raise RuntimeError(f"derived-table SQL does not exist: {args.derived_tables_sql}")
+    derived_tables_sql_sha256 = _sha256(args.derived_tables_sql)
     timeline_generator_sha = (
         _validate_timeline_generator(args.timeline_generator_sha)
         if args.study_inventory or args.timeline_generator_sha
@@ -860,16 +1185,22 @@ def main() -> int:
     try:
         db = sqlite3.connect(staging_path)
         if args.staging_db:
-            table_check = db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='slides'").fetchone()
-            if not table_check:
-                raise RuntimeError(f"staging database has no slides table: {staging_path}")
-            stats = {"selected_rows": db.execute("SELECT count(*) FROM slides").fetchone()[0],
-                     "study_count": db.execute("SELECT count(DISTINCT study_id) FROM slides").fetchone()[0],
-                     "resumed_from_staging": 1}
+            # Validation must finish before _cleanup.  In particular, a
+            # legacy four-field timing snapshot is rejected here, while the
+            # target ClickHouse tables remain untouched.
+            stats = _validate_staging(
+                db,
+                selected_study_ids=selected_study_ids,
+                prefixes=prefixes,
+                timeline_generator_sha=timeline_generator_sha,
+                derived_tables_sql_sha256=derived_tables_sql_sha256,
+                allow_incomplete_assets=args.allow_incomplete_assets,
+            )
+            stats["resumed_from_staging"] = 1
         else:
             db.execute("PRAGMA journal_mode=OFF")
             db.execute("PRAGMA synchronous=OFF")
-            db.execute("CREATE TABLE slides (study_id INTEGER NOT NULL, patient_internal INTEGER NOT NULL, image_id TEXT NOT NULL, sample_internal INTEGER, reference_internal INTEGER, rank_key TEXT NOT NULL, values_json TEXT NOT NULL, timing_json TEXT NOT NULL, PRIMARY KEY(study_id, patient_internal, image_id))")
+            _create_staging_schema(db)
             stats = _stage(
                 args,
                 db,
@@ -884,6 +1215,23 @@ def main() -> int:
                     "Databricks WSI hydration found incomplete asset bundles; "
                     "refusing to mutate ClickHouse"
                 )
+            _write_staging_metadata(
+                db,
+                selected_study_ids=selected_study_ids,
+                prefixes=prefixes,
+                timeline_generator_sha=timeline_generator_sha,
+                derived_tables_sql_sha256=derived_tables_sql_sha256,
+                stats=stats,
+                diagnostic=args.allow_incomplete_assets,
+            )
+            _validate_staging(
+                db,
+                selected_study_ids=selected_study_ids,
+                prefixes=prefixes,
+                timeline_generator_sha=timeline_generator_sha,
+                derived_tables_sql_sha256=derived_tables_sql_sha256,
+                allow_incomplete_assets=args.allow_incomplete_assets,
+            )
         if stats.get("selected_rows", 0) == 0:
             raise RuntimeError("Databricks WSI data did not overlap any target patient/sample; refusing to mutate ClickHouse")
         if args.allow_incomplete_assets:
@@ -911,7 +1259,7 @@ def main() -> int:
         print(json.dumps({"stage": stats, "study_ids": study_ids, "allowed_source_prefixes": prefixes}, sort_keys=True), flush=True)
         _cleanup(args, study_ids)
         _populate_tables(args, db, study_ids)
-        timeline_count = _insert_timeline(args, db, study_stable_by_id)
+        timeline_count = _insert_timeline(args, db, study_stable_by_id, patient_targets)
         db.close()
         # Rebuild all derived tables after WSI clinical attributes/events.
         print(f"inserted {timeline_count:,} pathology timeline events; rebuilding derived tables", flush=True)
@@ -939,7 +1287,7 @@ def main() -> int:
                     "selected_rows": stats["selected_rows"],
                     "study_count": len(study_ids),
                     "timeline_event_count": timeline_count,
-                    "derived_tables_sql_sha256": _sha256(args.derived_tables_sql),
+                    "derived_tables_sql_sha256": derived_tables_sql_sha256,
                     "timeline_generator_sha": timeline_generator_sha,
                 },
                 sort_keys=True,

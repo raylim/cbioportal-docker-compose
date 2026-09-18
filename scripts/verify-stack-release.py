@@ -26,8 +26,10 @@ study.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -43,6 +45,12 @@ class VerificationError(RuntimeError):
 
 ROOT_DIR = Path(__file__).resolve().parent
 PER_STUDY_VERIFIER = ROOT_DIR / "verify-study-load.py"
+
+
+def _inventory_sha256(value: dict[str, Any]) -> str:
+    payload = {key: item for key, item in value.items() if key != "inventory_sha256"}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _request_json(url: str, cookie: str) -> Any:
@@ -78,6 +86,30 @@ def _read_manifest(path: Path) -> tuple[str, list[dict[str, Any]]]:
             raise VerificationError(
                 "contains manifests require canonical IMPACT inventory metadata"
             )
+        declared_digest = inventory.get("inventory_sha256")
+        if not isinstance(declared_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", declared_digest):
+            raise VerificationError(
+                "contains manifests require a valid canonical IMPACT inventory_sha256"
+            )
+        if declared_digest != _inventory_sha256(inventory):
+            raise VerificationError("canonical IMPACT inventory checksum does not match its contents")
+        inventory_studies = inventory.get("studies")
+        if not isinstance(inventory_studies, list) or not inventory_studies:
+            raise VerificationError(
+                "contains manifests require a non-empty canonical IMPACT inventory studies array"
+            )
+        inventory_ids: set[str] = set()
+        for item in inventory_studies:
+            if not isinstance(item, dict) or not isinstance(item.get("study_id"), str):
+                raise VerificationError("canonical IMPACT inventory contains an invalid study entry")
+            study_id = item["study_id"].strip()
+            if not study_id or study_id in inventory_ids:
+                raise VerificationError(
+                    "canonical IMPACT inventory contains a duplicate or empty study_id"
+                )
+            inventory_ids.add(study_id)
+    else:
+        inventory_ids = set()
     studies = value.get("studies")
     if not isinstance(studies, list) or not studies:
         raise VerificationError("stack release manifest must contain a non-empty studies array")
@@ -189,6 +221,20 @@ def _read_manifest(path: Path) -> tuple[str, list[dict[str, Any]]]:
                 "require_wsi": require_wsi,
             }
         )
+    if catalog_policy == "contains":
+        manifest_ids = {str(item["study_id"]) for item in normalized}
+        if manifest_ids != inventory_ids:
+            missing = sorted(inventory_ids - manifest_ids)
+            unexpected = sorted(manifest_ids - inventory_ids)
+            details = []
+            if missing:
+                details.append("missing=" + ",".join(missing))
+            if unexpected:
+                details.append("unexpected=" + ",".join(unexpected))
+            raise VerificationError(
+                "release manifest study coverage does not match the canonical IMPACT inventory: "
+                + " ".join(details)
+            )
     return catalog_policy, normalized
 
 

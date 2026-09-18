@@ -65,10 +65,13 @@ def _build_capability_groups(
         if not match_level or not specimen_key:
             raise ValueError(f"WSI row {image_id} has no match/specimen key")
         capability = _truthy(row.get("CAN_SERVE_TILES"))
+        slide_type = (row.get("SLIDE_TYPE") or "").strip().lower()
         for stain_filter, include in (
             ("all", True),
             ("hne", _truthy(row.get("IS_HNE"))),
             ("ihc", _truthy(row.get("IS_IHC"))),
+            ("other", slide_type == "other" and not _truthy(row.get("IS_HNE")) and not _truthy(row.get("IS_IHC"))),
+            ("unknown", slide_type == "unknown" and not _truthy(row.get("IS_HNE")) and not _truthy(row.get("IS_IHC"))),
         ):
             if include:
                 groups[_group_key(patient_id, sample_id, match_level, specimen_key, stain_filter)].add(
